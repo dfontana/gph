@@ -1,0 +1,11 @@
+[package]
+name = "gph"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gph"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
