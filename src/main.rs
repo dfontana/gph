@@ -1,34 +1,31 @@
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process;
 
+use clap::Parser;
+
+#[derive(Parser)]
+#[command(about = "Lisp DSL compiler to Mermaid, SVG, and Kitty terminal")]
+struct Cli {
+    /// Input .gph file (reads stdin if omitted)
+    file: Option<PathBuf>,
+
+    /// Render to SVG or Kitty instead of emitting Mermaid text
+    #[arg(short, long)]
+    render: bool,
+
+    /// Write SVG output to this path (implies --render)
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
 fn main() {
-    let mut render_mode = false;
-    let mut output_path: Option<String> = None;
-    let mut file_arg: Option<String> = None;
-    let mut args = std::env::args().skip(1).peekable();
+    let cli = Cli::parse();
+    let render_mode = cli.render || cli.output.is_some();
 
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--render" | "-r" => render_mode = true,
-            "--output" | "-o" => {
-                output_path = args.next();
-                if output_path.is_none() {
-                    eprintln!("error: --output requires a path argument");
-                    process::exit(1);
-                }
-            }
-            _ => file_arg = Some(arg),
-        }
-    }
-
-    // -o implies --render
-    if output_path.is_some() {
-        render_mode = true;
-    }
-
-    let src = match file_arg {
+    let src = match cli.file {
         Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!("error reading '{}': {}", path, e);
+            eprintln!("error reading '{}': {}", path.display(), e);
             process::exit(1);
         }),
         None => {
@@ -42,11 +39,11 @@ fn main() {
     };
 
     if render_mode {
-        match output_path {
-            Some(ref path) => match gph::render_svg(&src) {
+        match cli.output {
+            Some(path) => match gph::render_svg(&src) {
                 Ok(svg) => {
-                    if let Err(e) = std::fs::write(path, svg) {
-                        eprintln!("error writing '{}': {}", path, e);
+                    if let Err(e) = std::fs::write(&path, svg) {
+                        eprintln!("error writing '{}': {}", path.display(), e);
                         process::exit(1);
                     }
                 }
