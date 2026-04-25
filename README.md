@@ -100,16 +100,9 @@ Two or more node IDs are required. With no label, all hops are emitted on one ch
 
 ```lisp
 (graph lr
-  ; Node declarations with shapes
-  (login "Login" round)
-  (validate "Validate Input" diamond)
-  (dashboard "Dashboard" stadium)
-  (error "Error" round)
-
-  ; Edge chains
-  (-> login validate)
-  (-> validate dashboard "ok")
-  (-> validate error "fail")
+  (-> (login "Login" round) (validate "Validate Input" diamond))
+  (-> validate (dashboard "Dashboard" stadium) "ok")
+  (-> validate (error "Error" round) "fail")
   (--> error login "retry"))  ; dotted back-edge
 ```
 
@@ -117,12 +110,12 @@ Compiles to:
 
 ```
 flowchart LR
-  login(Login)
-  validate{Validate Input}
-  dashboard([Dashboard])
-  error(Error)
+  login("Login")
+  validate{"Validate Input"}
   login --> validate
+  dashboard(["Dashboard"])
   validate -->|ok| dashboard
+  error("Error")
   validate -->|fail| error
   error -.->|retry| login
 ```

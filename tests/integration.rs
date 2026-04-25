@@ -256,3 +256,54 @@ fn node_label_quote_escaped() {
         "flowchart LR\n  n[\"say #quot;hi#quot;\"]",
     );
 }
+
+#[test]
+fn inline_node_in_edge() {
+    check(
+        r#"(graph lr (-> (a "Node A") b))"#,
+        "flowchart LR\n  a[\"Node A\"]\n  a --> b",
+    );
+}
+
+#[test]
+fn inline_node_with_shape() {
+    check(
+        r#"(graph lr (-> (a "A" round) (b "B" diamond)))"#,
+        "flowchart LR\n  a(\"A\")\n  b{\"B\"}\n  a --> b",
+    );
+}
+
+#[test]
+fn inline_node_mixed_bare_and_sub() {
+    check(
+        r#"(graph lr (-> (a "A") b (c "C")))"#,
+        "flowchart LR\n  a[\"A\"]\n  c[\"C\"]\n  a --> b --> c",
+    );
+}
+
+#[test]
+fn inline_node_referenced_again_bare() {
+    check(
+        r#"(graph lr (-> (a "A") (b "B")) (-> a b "again"))"#,
+        "flowchart LR\n  a[\"A\"]\n  b[\"B\"]\n  a --> b\n  a -->|again| b",
+    );
+}
+
+#[test]
+fn inline_node_full_example() {
+    let src = r#"(graph lr
+  (-> (login "Login" round) (validate "Validate Input" diamond))
+  (-> validate (dashboard "Dashboard" stadium) "ok")
+  (-> validate (error "Error" round) "fail")
+  (--> error login "retry"))"#;
+    let out = gph::compile(src).unwrap();
+    assert!(out.starts_with("flowchart LR"));
+    assert!(out.contains("login(\"Login\")"));
+    assert!(out.contains("validate{\"Validate Input\"}"));
+    assert!(out.contains("dashboard([\"Dashboard\"])"));
+    assert!(out.contains("error(\"Error\")"));
+    assert!(out.contains("login --> validate"));
+    assert!(out.contains("validate -->|ok| dashboard"));
+    assert!(out.contains("validate -->|fail| error"));
+    assert!(out.contains("error -.->|retry| login"));
+}

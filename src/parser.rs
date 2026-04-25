@@ -136,7 +136,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     break;
                 }
-                Some(TokenKind::LParen) => stmts.push(self.parse_stmt()?),
+                Some(TokenKind::LParen) => stmts.extend(self.parse_stmts()?),
                 None => {
                     let (l, c) = self.current_pos();
                     return Err(ParseError {
@@ -159,12 +159,12 @@ impl<'a> Parser<'a> {
         Ok(Graph { direction, stmts })
     }
 
-    fn parse_stmt(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_stmts(&mut self) -> Result<Vec<Stmt>, ParseError> {
         self.expect_lparen()?;
 
         match self.peek_kind() {
             Some(TokenKind::Arrow(_)) => self.parse_edge(),
-            Some(TokenKind::Ident(_)) => self.parse_node(),
+            Some(TokenKind::Ident(_)) => Ok(vec![Stmt::Node(self.parse_node()?)]),
             _ => {
                 let (l, c) = self.current_pos();
                 Err(ParseError {
@@ -176,7 +176,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_edge(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_edge(&mut self) -> Result<Vec<Stmt>, ParseError> {
         let (arr_line, arr_col) = self.current_pos();
         let arrow_str = match self.advance() {
             Some(Token {
@@ -191,10 +191,22 @@ impl<'a> Parser<'a> {
             col: arr_col,
         })?;
 
-        // Collect identifiers
-        let mut chain = Vec::new();
-        while let Some(TokenKind::Ident(_)) = self.peek_kind() {
-            chain.push(self.expect_ident()?);
+        // Collect chain: bare identifiers or inline (id "Label" shape?) sub-expressions
+        let mut chain: Vec<String> = Vec::new();
+        let mut pending: Vec<NodeDecl> = Vec::new();
+        loop {
+            match self.peek_kind() {
+                Some(TokenKind::Ident(_)) => {
+                    chain.push(self.expect_ident()?);
+                }
+                Some(TokenKind::LParen) => {
+                    self.advance(); // consume `(`
+                    let decl = self.parse_node()?;
+                    chain.push(decl.id.clone());
+                    pending.push(decl);
+                }
+                _ => break,
+            }
         }
 
         if chain.len() < 2 {
@@ -222,14 +234,17 @@ impl<'a> Parser<'a> {
         };
 
         self.expect_rparen()?;
-        Ok(Stmt::Edge(EdgeDecl {
+
+        let mut stmts: Vec<Stmt> = pending.into_iter().map(Stmt::Node).collect();
+        stmts.push(Stmt::Edge(EdgeDecl {
             chain,
             label,
             arrow,
-        }))
+        }));
+        Ok(stmts)
     }
 
-    fn parse_node(&mut self) -> Result<Stmt, ParseError> {
+    fn parse_node(&mut self) -> Result<NodeDecl, ParseError> {
         let id = self.expect_ident()?;
 
         // Optional label
@@ -256,7 +271,6 @@ impl<'a> Parser<'a> {
                     self.advance();
                     sh
                 } else {
-                    // Not a shape keyword — leave it, let rparen handle it
                     Shape::default()
                 }
             }
@@ -264,7 +278,7 @@ impl<'a> Parser<'a> {
         };
 
         self.expect_rparen()?;
-        Ok(Stmt::Node(NodeDecl { id, label, shape }))
+        Ok(NodeDecl { id, label, shape })
     }
 }
 
