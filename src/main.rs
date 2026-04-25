@@ -1,12 +1,25 @@
 use std::io::{self, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Convert ```gph fences to ```mermaid in markdown files (in-place)
+    Md {
+        /// Markdown files to process (use shell globbing for multiple: **/*.md)
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
+}
 
 #[derive(Parser)]
 #[command(about = "Lisp DSL compiler to Mermaid, SVG, and Kitty terminal")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     /// Input .gph file (reads stdin if omitted)
     file: Option<PathBuf>,
 
@@ -19,8 +32,82 @@ struct Cli {
     output: Option<PathBuf>,
 }
 
+fn process_md_file(path: &Path) -> bool {
+    let original = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading '{}': {}", path.display(), e);
+            return false;
+        }
+    };
+
+    let lines: Vec<&str> = original.lines().collect();
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim_end() == "```gph" {
+            let open_idx = i;
+            let mut content: Vec<&str> = vec![];
+            i += 1;
+            while i < lines.len() && lines[i].trim_end() != "```" {
+                content.push(lines[i]);
+                i += 1;
+            }
+            let close_found = i < lines.len();
+            if close_found {
+                match gph::compile(&content.join("\n")) {
+                    Ok(mermaid) => {
+                        out.push("```mermaid".to_string());
+                        out.extend(mermaid.lines().map(str::to_owned));
+                        out.push("```".to_string());
+                    }
+                    Err(e) => {
+                        eprintln!("{}:{}: {}", path.display(), open_idx + 1, e);
+                        out.push(line.to_owned());
+                        out.extend(content.iter().map(|s| s.to_string()));
+                        out.push(lines[i].to_owned());
+                    }
+                }
+                i += 1;
+            } else {
+                out.push(line.to_owned());
+                out.extend(content.iter().map(|s| s.to_string()));
+            }
+        } else {
+            out.push(line.to_owned());
+            i += 1;
+        }
+    }
+
+    let mut new_content = out.join("\n");
+    if original.ends_with('\n') {
+        new_content.push('\n');
+    }
+
+    if new_content == original {
+        return true;
+    }
+
+    if let Err(e) = std::fs::write(path, &new_content) {
+        eprintln!("error writing '{}': {}", path.display(), e);
+        return false;
+    }
+    true
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    if let Some(Commands::Md { files }) = cli.command {
+        let ok = files.iter().all(|p| process_md_file(p));
+        if !ok {
+            process::exit(1);
+        }
+        return;
+    }
+
     let render_mode = cli.render || cli.output.is_some();
 
     let src = match cli.file {
