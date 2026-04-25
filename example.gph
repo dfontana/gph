@@ -1,0 +1,28 @@
+; CI/CD pipeline — exercises all shapes, arrow types, and edge labels
+(graph lr
+  ; nodes
+  (push "git push" stadium)
+  (ci "Run CI" hex)
+  (lint "Lint" round)
+  (test "Tests" round)
+  (build "Build" sub)
+  (gate "Deploy?" diamond)
+  (staging "Staging" round)
+  (smoke "Smoke Tests" hex)
+  (prod "Production" stadium)
+  (rollback "Rollback" round)
+  (notify "Notify Team")
+
+  ; pipeline flow
+  (-> push ci)
+  (-> ci lint "start")
+  (-> ci test "start")
+  (-> lint build)
+  (-> test build)
+  (-> build gate)
+  (-> gate staging "approve")
+  (-x gate rollback "reject")
+  (-> staging smoke)
+  (-> smoke prod "pass")
+  (--> smoke staging "retry")
+  (=> prod notify "done"))
