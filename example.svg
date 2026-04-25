@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="577" height="169" viewBox="0 0 577 169">
+  <defs>
+    <marker id="arr-normal" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="black" stroke="black" stroke-width="1"/>
+    </marker>
+    <marker id="arr-dotted" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="black" stroke="black" stroke-width="1"/>
+    </marker>
+    <marker id="arr-thick" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#333" stroke="#333" stroke-width="2"/>
+    </marker>
+    <marker id="arr-circle" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <circle cx="4" cy="4" r="3" fill="none" stroke="black" stroke-width="1.5"/>
+    </marker>
+    <marker id="arr-cross" markerWidth="8" markerHeight="8" refX="4" refY="4" orient="auto">
+      <line x1="1" y1="1" x2="7" y2="7" stroke="black" stroke-width="1.5"/>
+      <line x1="7" y1="1" x2="1" y2="7" stroke="black" stroke-width="1.5"/>
+    </marker>
+  </defs>
+  <rect width="577" height="169" fill="white"/>
+  <polyline points="140.0,40.0 220.0,40.0" fill="none" stroke="black" stroke-width="1.5" marker-end="url(#arr-normal)"/>
+
+  <polyline points="356.0,40.0 436.0,40.0" fill="none" stroke="black" stroke-width="1.5" marker-end="url(#arr-normal)"/>
+  <text x="396.0" y="28.0" font-family="sans-serif" font-size="11" text-anchor="middle" fill="#555">ok</text>
+  <polyline points="356.0,40.0 436.0,104.0" fill="none" stroke="black" stroke-width="1.5" marker-end="url(#arr-normal)"/>
+  <text x="396.0" y="60.0" font-family="sans-serif" font-size="11" text-anchor="middle" fill="#555">fail</text>
+  <polyline points="140.0,40.0 220.0,104.0 436.0,104.0" fill="none" stroke="#555" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#arr-dotted)"/>
+  <text x="180.0" y="60.0" font-family="sans-serif" font-size="11" text-anchor="middle" fill="#555">retry</text>
+  <rect x="20.0" y="20.0" width="120.0" height="40.0" rx="8" ry="8" fill="white" stroke="black" stroke-width="1.5"/>
+  <text x="80.0" y="40.0" font-family="sans-serif" font-size="13" text-anchor="middle" dominant-baseline="middle">Login</text>
+  <polygon points="288.0,20.0 356.0,40.0 288.0,60.0 220.0,40.0" fill="white" stroke="black" stroke-width="1.5"/>
+  <text x="288.0" y="40.0" font-family="sans-serif" font-size="13" text-anchor="middle" dominant-baseline="middle">Validate Input</text>
+  <rect x="436.0" y="20.0" width="120.0" height="40.0" rx="20.0" ry="20.0" fill="white" stroke="black" stroke-width="1.5"/>
+  <text x="496.0" y="40.0" font-family="sans-serif" font-size="13" text-anchor="middle" dominant-baseline="middle">Dashboard</text>
+  <rect x="436.0" y="84.0" width="120.0" height="40.0" rx="8" ry="8" fill="white" stroke="black" stroke-width="1.5"/>
+  <text x="496.0" y="104.0" font-family="sans-serif" font-size="13" text-anchor="middle" dominant-baseline="middle">Error</text>
+</svg>

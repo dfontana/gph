@@ -127,6 +127,8 @@ flowchart LR
   error -.->|retry| login
 ```
 
+![example graph](example.svg)
+
 ---
 
 ## Error messages
