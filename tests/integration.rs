@@ -307,3 +307,215 @@ fn inline_node_full_example() {
     assert!(out.contains("validate -->|fail| error"));
     assert!(out.contains("error -.->|retry| login"));
 }
+
+// ---- gph parse (mermaid → gph) round-trip tests ----------------------------
+
+fn check_decompile(mermaid: &str, expected_gph: &str) {
+    let got = gph::decompile(mermaid).expect("decompile failed");
+    assert_eq!(
+        got.trim(),
+        expected_gph.trim(),
+        "\nMermaid input:\n{}",
+        mermaid
+    );
+}
+
+fn check_round_trip(src: &str) {
+    let mermaid = gph::compile(src).expect("compile failed");
+    let gph_out = gph::decompile(&mermaid).expect("decompile failed");
+    let mermaid2 = gph::compile(&gph_out).expect("recompile failed");
+    assert_eq!(
+        mermaid, mermaid2,
+        "round-trip mismatch\nOriginal gph:\n{}\nMermaid:\n{}\nDecompiled gph:\n{}",
+        src, mermaid, gph_out
+    );
+}
+
+#[test]
+fn decompile_simple_edge() {
+    check_decompile("flowchart LR\n  a --> b", "(graph lr\n  (-> a b))");
+}
+
+#[test]
+fn decompile_empty_graph() {
+    check_decompile("flowchart TD", "(graph td)");
+}
+
+#[test]
+fn decompile_node_shapes() {
+    check_decompile(
+        "flowchart TD\n  n1[\"Box\"]\n  n2(\"Round\")\n  n3{\"Diamond\"}\n  n4([\"Stadium\"])\n  n5{{\"Hex\"}}\n  n6[[\"Sub\"]]",
+        "(graph td\n  (n1 \"Box\")\n  (n2 \"Round\" round)\n  (n3 \"Diamond\" diamond)\n  (n4 \"Stadium\" stadium)\n  (n5 \"Hex\" hex)\n  (n6 \"Sub\" sub))",
+    );
+}
+
+#[test]
+fn decompile_all_arrow_types() {
+    check_decompile("flowchart LR\n  a --> b", "(graph lr\n  (-> a b))");
+    check_decompile("flowchart LR\n  a -.-> b", "(graph lr\n  (--> a b))");
+    check_decompile("flowchart LR\n  a ==> b", "(graph lr\n  (=> a b))");
+    check_decompile("flowchart LR\n  a --o b", "(graph lr\n  (-o a b))");
+    check_decompile("flowchart LR\n  a --x b", "(graph lr\n  (-x a b))");
+}
+
+#[test]
+fn decompile_labeled_edge() {
+    check_decompile(
+        "flowchart LR\n  a -->|ok| b",
+        "(graph lr\n  (-> a b \"ok\"))",
+    );
+}
+
+#[test]
+fn decompile_chain_reconstructed() {
+    // gph emits a labeled 3-node chain as two lines; parser must reconstruct it
+    check_decompile(
+        "flowchart LR\n  a --> b\n  b -->|done| c",
+        "(graph lr\n  (-> a b c \"done\"))",
+    );
+}
+
+#[test]
+fn decompile_unlabeled_chain_on_one_line() {
+    check_decompile("flowchart LR\n  a --> b --> c", "(graph lr\n  (-> a b c))");
+}
+
+#[test]
+fn decompile_node_decl_interrupts_chain() {
+    // A node decl between the prefix line and labeled hop breaks the chain.
+    // Both resulting separate edges compile to the same mermaid output.
+    check_decompile(
+        "flowchart LR\n  a --> b\n  c[\"C\"]\n  b -->|label| c",
+        "(graph lr\n  (-> a b)\n  (c \"C\")\n  (-> b c \"label\"))",
+    );
+}
+
+#[test]
+fn decompile_label_with_escaped_pipe() {
+    check_decompile(
+        "flowchart LR\n  a -->|yes#124;no| b",
+        "(graph lr\n  (-> a b \"yes|no\"))",
+    );
+}
+
+#[test]
+fn decompile_label_with_escaped_quote() {
+    check_decompile(
+        "flowchart LR\n  n[\"say #quot;hi#quot;\"]",
+        "(graph lr\n  (n \"say \\\"hi\\\"\"))",
+    );
+}
+
+#[test]
+fn round_trip_simple() {
+    check_round_trip("(graph lr (-> a b))");
+}
+
+#[test]
+fn round_trip_all_directions() {
+    check_round_trip("(graph lr (-> a b))");
+    check_round_trip("(graph rl (-> a b))");
+    check_round_trip("(graph td (-> a b))");
+    check_round_trip("(graph bt (-> a b))");
+}
+
+#[test]
+fn round_trip_all_shapes() {
+    check_round_trip(
+        r#"(graph td
+      (n1 "Box")
+      (n2 "Round" round)
+      (n3 "Diamond" diamond)
+      (n4 "Stadium" stadium)
+      (n5 "Hex" hex)
+      (n6 "Sub" sub))"#,
+    );
+}
+
+#[test]
+fn round_trip_labeled_chain_three_nodes() {
+    check_round_trip(r#"(graph lr (-> a b c "done"))"#);
+}
+
+#[test]
+fn round_trip_labeled_chain_five_nodes() {
+    check_round_trip(r#"(graph lr (-> a b c d e "done"))"#);
+}
+
+#[test]
+fn round_trip_all_arrows() {
+    check_round_trip("(graph lr (--> a b))");
+    check_round_trip("(graph lr (=> a b))");
+    check_round_trip("(graph lr (-o a b))");
+    check_round_trip("(graph lr (-x a b))");
+}
+
+#[test]
+fn round_trip_node_id_with_dashes() {
+    check_round_trip("(graph lr (-> my-node other-node))");
+}
+
+#[test]
+fn round_trip_label_escaped_pipe() {
+    check_round_trip(r#"(graph lr (-> a b "yes|no"))"#);
+}
+
+#[test]
+fn round_trip_label_escaped_quote() {
+    check_round_trip("(graph lr (n \"say \\\"hi\\\"\"))");
+}
+
+#[test]
+fn round_trip_full_example() {
+    check_round_trip(
+        r#"(graph lr
+  (login "Login" round)
+  (validate "Validate Input" diamond)
+  (dashboard "Dashboard" stadium)
+  (error "Error" round)
+  (-> login validate)
+  (-> validate dashboard "ok")
+  (-> validate error "fail")
+  (--> error login "retry"))"#,
+    );
+}
+
+#[test]
+fn round_trip_inline_nodes() {
+    check_round_trip(
+        r#"(graph lr
+  (-> (login "Login" round) (validate "Validate Input" diamond))
+  (-> validate (dashboard "Dashboard" stadium) "ok")
+  (-> validate (error "Error" round) "fail")
+  (--> error login "retry"))"#,
+    );
+}
+
+#[test]
+fn round_trip_example_file() {
+    let src = r#"(graph lr
+  (push "git push" stadium)
+  (ci "Run CI" hex)
+  (lint "Lint" round)
+  (test "Tests" round)
+  (build "Build" sub)
+  (gate "Deploy?" diamond)
+  (staging "Staging" round)
+  (smoke "Smoke Tests" hex)
+  (prod "Production" stadium)
+  (rollback "Rollback" round)
+  (notify "Notify Team")
+  (-> push ci)
+  (-> ci lint "start")
+  (-> ci test "start")
+  (-> lint build)
+  (-> test build)
+  (-> build gate)
+  (-> gate staging "approve")
+  (-x gate rollback "reject")
+  (-> staging smoke)
+  (-> smoke prod "pass")
+  (--> smoke staging "retry")
+  (=> prod notify "done"))"#;
+    check_round_trip(src);
+}

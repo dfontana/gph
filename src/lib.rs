@@ -1,8 +1,10 @@
 mod ast;
 mod codegen;
+mod gph_printer;
 mod kitty;
 mod layout;
 mod lexer;
+mod mermaid_parser;
 mod parser;
 mod svg;
 pub mod tui;
@@ -32,6 +34,11 @@ pub fn render_kitty(src: &str) -> Result<(), String> {
     let lay = layout::compute(&graph);
     kitty::display(&lay);
     Ok(())
+}
+
+pub fn decompile(src: &str) -> Result<String, String> {
+    let graph = mermaid_parser::parse(src)?;
+    Ok(gph_printer::print(&graph))
 }
 
 pub fn kitty_supported() -> bool {

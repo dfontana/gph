@@ -17,6 +17,8 @@ enum Commands {
         /// .gph file to edit; creates a temp file if omitted
         file: Option<PathBuf>,
     },
+    /// Parse a Mermaid flowchart from stdin and emit gph syntax
+    Parse,
 }
 
 #[derive(Parser)]
@@ -24,9 +26,6 @@ enum Commands {
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-
-    /// Input .gph file (reads stdin if omitted)
-    file: Option<PathBuf>,
 
     /// Render to SVG or Kitty instead of emitting Mermaid text
     #[arg(short, long)]
@@ -124,25 +123,32 @@ fn main() {
             }
             return;
         }
-        None => {}
-    }
-
-    let render_mode = cli.render || cli.output.is_some();
-
-    let src = match cli.file {
-        Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|e| {
-            eprintln!("error reading '{}': {}", path.display(), e);
-            process::exit(1);
-        }),
-        None => {
+        Some(Commands::Parse) => {
             let mut buf = String::new();
             io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
                 eprintln!("error reading stdin: {}", e);
                 process::exit(1);
             });
-            buf
+            match gph::decompile(&buf) {
+                Ok(out) => println!("{}", out),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    process::exit(1);
+                }
+            }
+            return;
         }
-    };
+        None => {}
+    }
+
+    let render_mode = cli.render || cli.output.is_some();
+
+    let mut buf = String::new();
+    io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+        eprintln!("error reading stdin: {}", e);
+        process::exit(1);
+    });
+    let src = buf;
 
     if render_mode {
         match cli.output {
