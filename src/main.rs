@@ -12,6 +12,11 @@ enum Commands {
         #[arg(required = true)]
         files: Vec<PathBuf>,
     },
+    /// Open interactive split-pane TUI (requires Kitty terminal)
+    Tui {
+        /// .gph file to edit; creates a temp file if omitted
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Parser)]
@@ -100,12 +105,26 @@ fn process_md_file(path: &Path) -> bool {
 fn main() {
     let cli = Cli::parse();
 
-    if let Some(Commands::Md { files }) = cli.command {
-        let ok = files.iter().all(|p| process_md_file(p));
-        if !ok {
-            process::exit(1);
+    match cli.command {
+        Some(Commands::Md { files }) => {
+            let ok = files.iter().all(|p| process_md_file(p));
+            if !ok {
+                process::exit(1);
+            }
+            return;
         }
-        return;
+        Some(Commands::Tui { file }) => {
+            if !gph::kitty_supported() {
+                eprintln!("error: `gph tui` requires a Kitty terminal (KITTY_WINDOW_ID not set)");
+                process::exit(1);
+            }
+            if let Err(e) = gph::tui::run(file) {
+                eprintln!("tui error: {e}");
+                process::exit(1);
+            }
+            return;
+        }
+        None => {}
     }
 
     let render_mode = cli.render || cli.output.is_some();

@@ -13,23 +13,44 @@ pub fn is_supported() -> bool {
         || std::env::var("TERM").ok().as_deref() == Some("xterm-kitty")
 }
 
-pub fn display(layout: &Layout) {
+pub fn render_to_rgba(layout: &Layout) -> (Vec<u8>, usize, usize) {
     let pw = (layout.width * SCALE).ceil() as usize + 1;
     let ph = (layout.height * SCALE).ceil() as usize + 1;
     let mut canvas = Canvas::new(pw, ph);
-
-    // Draw edges first
     for e in &layout.edges {
         draw_edge(&mut canvas, e);
     }
-    // Draw nodes on top
     for n in &layout.nodes {
         draw_node(&mut canvas, n);
     }
+    (canvas.pixels, pw, ph)
+}
 
-    // Transmit via Kitty protocol
-    let b64 = base64_encode(&canvas.pixels);
-    transmit(pw, ph, &b64);
+pub fn display(layout: &Layout) {
+    let (pixels, pw, ph) = render_to_rgba(layout);
+    let b64 = base64_encode(&pixels);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    transmit_to(pw, ph, &b64, &mut out);
+    let _ = out.write_all(b"\n");
+    let _ = out.flush();
+}
+
+pub fn display_in_pane(
+    rgba: &[u8],
+    pixel_w: usize,
+    pixel_h: usize,
+    cols: u16,
+    rows: u16,
+    out: &mut impl Write,
+) {
+    let b64 = base64_encode(rgba);
+    transmit_pane(pixel_w, pixel_h, cols, rows, &b64, out);
+}
+
+pub fn delete_all(out: &mut impl Write) {
+    let _ = out.write_all(b"\x1b_Ga=d,d=A\x1b\\");
+    let _ = out.flush();
 }
 
 fn draw_node(canvas: &mut Canvas, n: &LayoutNode) {
@@ -384,9 +405,7 @@ fn draw_arc(canvas: &mut Canvas, cx: i32, cy: i32, r: i32, quadrant: u8, color: 
 
 // ---- Kitty protocol --------------------------------------------------------
 
-fn transmit(w: usize, h: usize, b64: &[u8]) {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+fn transmit_to(w: usize, h: usize, b64: &[u8], out: &mut impl Write) {
     let chunk_size = 4096;
     let chunks: Vec<&[u8]> = b64.chunks(chunk_size).collect();
     let total = chunks.len();
@@ -401,7 +420,23 @@ fn transmit(w: usize, h: usize, b64: &[u8]) {
         let _ = out.write_all(chunk);
         let _ = out.write_all(b"\x1b\\");
     }
-    let _ = out.write_all(b"\n");
+}
+
+fn transmit_pane(w: usize, h: usize, cols: u16, rows: u16, b64: &[u8], out: &mut impl Write) {
+    let chunk_size = 4096;
+    let chunks: Vec<&[u8]> = b64.chunks(chunk_size).collect();
+    let total = chunks.len();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let more = if i + 1 < total { 1 } else { 0 };
+        if i == 0 {
+            let header = format!("\x1b_Ga=T,f=32,s={w},v={h},c={cols},r={rows},q=2,m={more};");
+            let _ = out.write_all(header.as_bytes());
+        } else {
+            let _ = out.write_all(format!("\x1b_Gm={more};").as_bytes());
+        }
+        let _ = out.write_all(chunk);
+        let _ = out.write_all(b"\x1b\\");
+    }
     let _ = out.flush();
 }
 
