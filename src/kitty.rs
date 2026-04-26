@@ -31,7 +31,7 @@ pub fn display(layout: &Layout) {
     let b64 = base64_encode(&pixels);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    transmit_to(pw, ph, &b64, &mut out);
+    transmit(pw, ph, None, &b64, &mut out);
     let _ = out.write_all(b"\n");
     let _ = out.flush();
 }
@@ -45,7 +45,8 @@ pub fn display_in_pane(
     out: &mut impl Write,
 ) {
     let b64 = base64_encode(rgba);
-    transmit_pane(pixel_w, pixel_h, cols, rows, &b64, out);
+    transmit(pixel_w, pixel_h, Some((cols, rows)), &b64, out);
+    let _ = out.flush();
 }
 
 pub fn delete_all(out: &mut impl Write) {
@@ -185,9 +186,9 @@ struct Canvas {
 
 impl Canvas {
     fn new(w: usize, h: usize) -> Self {
-        let mut pixels = vec![0u8; w * h * 4];
-        for p in pixels.chunks_exact_mut(4) {
-            p.copy_from_slice(&BG);
+        let mut pixels = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            pixels.extend_from_slice(&BG);
         }
         Canvas {
             pixels,
@@ -405,39 +406,27 @@ fn draw_arc(canvas: &mut Canvas, cx: i32, cy: i32, r: i32, quadrant: u8, color: 
 
 // ---- Kitty protocol --------------------------------------------------------
 
-fn transmit_to(w: usize, h: usize, b64: &[u8], out: &mut impl Write) {
+fn transmit(w: usize, h: usize, cell_size: Option<(u16, u16)>, b64: &[u8], out: &mut impl Write) {
     let chunk_size = 4096;
-    let chunks: Vec<&[u8]> = b64.chunks(chunk_size).collect();
-    let total = chunks.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let more = if i + 1 < total { 1 } else { 0 };
-        if i == 0 {
-            let header = format!("\x1b_Ga=T,f=32,s={w},v={h},q=2,m={more};");
-            let _ = out.write_all(header.as_bytes());
+    let mut iter = b64.chunks(chunk_size).peekable();
+    let mut first = true;
+    while let Some(chunk) = iter.next() {
+        let more = if iter.peek().is_some() { 1 } else { 0 };
+        if first {
+            let cell_part = match cell_size {
+                Some((cols, rows)) => format!(",c={cols},r={rows}"),
+                None => String::new(),
+            };
+            let _ = out.write_all(
+                format!("\x1b_Ga=T,f=32,s={w},v={h}{cell_part},q=2,m={more};").as_bytes(),
+            );
+            first = false;
         } else {
             let _ = out.write_all(format!("\x1b_Gm={more};").as_bytes());
         }
         let _ = out.write_all(chunk);
         let _ = out.write_all(b"\x1b\\");
     }
-}
-
-fn transmit_pane(w: usize, h: usize, cols: u16, rows: u16, b64: &[u8], out: &mut impl Write) {
-    let chunk_size = 4096;
-    let chunks: Vec<&[u8]> = b64.chunks(chunk_size).collect();
-    let total = chunks.len();
-    for (i, chunk) in chunks.iter().enumerate() {
-        let more = if i + 1 < total { 1 } else { 0 };
-        if i == 0 {
-            let header = format!("\x1b_Ga=T,f=32,s={w},v={h},c={cols},r={rows},q=2,m={more};");
-            let _ = out.write_all(header.as_bytes());
-        } else {
-            let _ = out.write_all(format!("\x1b_Gm={more};").as_bytes());
-        }
-        let _ = out.write_all(chunk);
-        let _ = out.write_all(b"\x1b\\");
-    }
-    let _ = out.flush();
 }
 
 // ---- Base64 ----------------------------------------------------------------

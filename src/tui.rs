@@ -24,6 +24,7 @@ struct State {
     textarea: TextArea<'static>,
     render: Result<(Vec<u8>, usize, usize), String>,
     error_msg: Option<String>,
+    dirty: bool,
 }
 
 pub fn run(file: Option<PathBuf>) -> Result<(), String> {
@@ -54,16 +55,19 @@ fn event_loop(
     state: &mut State,
 ) -> Result<(), String> {
     loop {
-        let sz = terminal.size().map_err(|e| e.to_string())?;
-        let size = Rect::new(0, 0, sz.width, sz.height);
-        let right_pane = compute_right_pane_inner(size);
+        if state.dirty {
+            let sz = terminal.size().map_err(|e| e.to_string())?;
+            let size = Rect::new(0, 0, sz.width, sz.height);
+            let right_pane = compute_right_pane_inner(size);
 
-        terminal
-            .draw(|frame| draw_frame(frame, state))
-            .map_err(|e| e.to_string())?;
+            terminal
+                .draw(|frame| draw_frame(frame, state))
+                .map_err(|e| e.to_string())?;
 
-        crate::kitty::delete_all(terminal.backend_mut());
-        render_kitty_in_pane(state, right_pane, terminal.backend_mut());
+            crate::kitty::delete_all(terminal.backend_mut());
+            render_kitty_in_pane(state, right_pane, terminal.backend_mut());
+            state.dirty = false;
+        }
 
         if !event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
             continue;
@@ -90,6 +94,7 @@ fn event_loop(
             }
             Event::Resize(_, _) => {
                 terminal.clear().map_err(|e| e.to_string())?;
+                state.dirty = true;
             }
             ev => {
                 if state.textarea.input(ev) {
@@ -125,6 +130,7 @@ fn init_state(file: Option<PathBuf>) -> Result<State, String> {
         textarea,
         render: Err("not rendered yet".into()),
         error_msg: None,
+        dirty: true,
     };
     rerender(&mut state);
     Ok(state)
@@ -147,11 +153,14 @@ fn make_textarea(content: &str, path: &Path) -> TextArea<'static> {
 }
 
 fn save_file(state: &State) -> Result<(), String> {
-    let mut content = state.source.clone();
-    if !content.is_empty() && !content.ends_with('\n') {
+    if state.source.ends_with('\n') || state.source.is_empty() {
+        std::fs::write(&state.file_path, state.source.as_bytes())
+    } else {
+        let mut content = state.source.clone();
         content.push('\n');
+        std::fs::write(&state.file_path, content.as_bytes())
     }
-    std::fs::write(&state.file_path, content).map_err(|e| format!("save failed: {e}"))
+    .map_err(|e| format!("save failed: {e}"))
 }
 
 fn rerender(state: &mut State) {
@@ -164,6 +173,7 @@ fn rerender(state: &mut State) {
             state.error_msg = Some(msg);
         }
     }
+    state.dirty = true;
 }
 
 fn open_editor(

@@ -220,12 +220,7 @@ pub fn compute(graph: &Graph) -> Layout {
             Direction::BT => (cx + w / 2.0, cy + NODE_H),
         }
     };
-    let dummy_port = |cx: f32, cy: f32| -> (f32, f32) {
-        match &graph.direction {
-            Direction::LR | Direction::RL => (cx, cy + NODE_H / 2.0),
-            Direction::TD | Direction::BT => (cx, cy + NODE_H / 2.0),
-        }
-    };
+    let dummy_port = |cx: f32, cy: f32| -> (f32, f32) { (cx, cy + NODE_H / 2.0) };
 
     // --- Build output ---
     // Map from original node index to output node index

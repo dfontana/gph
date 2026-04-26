@@ -82,23 +82,30 @@ impl<'a> Parser<'a> {
     }
 
     fn expect_ident(&mut self) -> Result<String, ParseError> {
-        match self.peek_kind() {
-            Some(TokenKind::Ident(_)) => {
-                if let Some(t) = self.advance() {
-                    if let TokenKind::Ident(s) = &t.kind {
-                        return Ok(s.clone());
-                    }
-                }
+        if matches!(self.peek_kind(), Some(TokenKind::Ident(_))) {
+            let t = self.advance().unwrap();
+            let TokenKind::Ident(s) = &t.kind else {
                 unreachable!()
-            }
-            _ => {
-                let (l, c) = self.current_pos();
-                Err(ParseError {
-                    msg: "expected identifier".into(),
-                    line: l,
-                    col: c,
-                })
-            }
+            };
+            return Ok(s.clone());
+        }
+        let (l, c) = self.current_pos();
+        Err(ParseError {
+            msg: "expected identifier".into(),
+            line: l,
+            col: c,
+        })
+    }
+
+    fn parse_optional_label(&mut self) -> Option<String> {
+        if matches!(self.peek_kind(), Some(TokenKind::Str(_))) {
+            let t = self.advance().unwrap();
+            let TokenKind::Str(s) = &t.kind else {
+                unreachable!()
+            };
+            Some(s.clone())
+        } else {
+            None
         }
     }
 
@@ -217,21 +224,7 @@ impl<'a> Parser<'a> {
             });
         }
 
-        // Optional label
-        let label = match self.peek_kind() {
-            Some(TokenKind::Str(_)) => {
-                if let Some(t) = self.advance() {
-                    if let TokenKind::Str(s) = &t.kind {
-                        Some(s.clone())
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
-            _ => None,
-        };
+        let label = self.parse_optional_label();
 
         self.expect_rparen()?;
 
@@ -247,21 +240,7 @@ impl<'a> Parser<'a> {
     fn parse_node(&mut self) -> Result<NodeDecl, ParseError> {
         let id = self.expect_ident()?;
 
-        // Optional label
-        let label = match self.peek_kind() {
-            Some(TokenKind::Str(_)) => {
-                if let Some(t) = self.advance() {
-                    if let TokenKind::Str(s) = &t.kind {
-                        Some(s.clone())
-                    } else {
-                        unreachable!()
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
-            _ => None,
-        };
+        let label = self.parse_optional_label();
 
         // Optional shape (only if label was present)
         let shape = match self.peek_kind() {

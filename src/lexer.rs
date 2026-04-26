@@ -129,7 +129,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     col: tok_col,
                 });
             }
-            // Arrow tokens starting with '-'
             '-' => {
                 let arrow = try_lex_arrow(&chars, pos, line, col)?;
                 let len = arrow.len();
@@ -141,7 +140,6 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 pos += len;
                 col += len;
             }
-            // Arrow tokens starting with '='
             '=' => {
                 if chars.get(pos + 1) == Some(&'>') {
                     tokens.push(Token {
