@@ -2,7 +2,6 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -24,7 +23,6 @@ struct State {
     textarea: TextArea<'static>,
     render: Result<(Vec<u8>, usize, usize), String>,
     error_msg: Option<String>,
-    dirty: bool,
 }
 
 pub fn run(file: Option<PathBuf>) -> Result<(), String> {
@@ -55,23 +53,16 @@ fn event_loop(
     state: &mut State,
 ) -> Result<(), String> {
     loop {
-        if state.dirty {
-            let sz = terminal.size().map_err(|e| e.to_string())?;
-            let size = Rect::new(0, 0, sz.width, sz.height);
-            let right_pane = compute_right_pane_inner(size);
+        let sz = terminal.size().map_err(|e| e.to_string())?;
+        let size = Rect::new(0, 0, sz.width, sz.height);
+        let right_pane = compute_right_pane_inner(size);
 
-            terminal
-                .draw(|frame| draw_frame(frame, state))
-                .map_err(|e| e.to_string())?;
+        terminal
+            .draw(|frame| draw_frame(frame, state))
+            .map_err(|e| e.to_string())?;
 
-            crate::kitty::delete_all(terminal.backend_mut());
-            render_kitty_in_pane(state, right_pane, terminal.backend_mut());
-            state.dirty = false;
-        }
-
-        if !event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
-            continue;
-        }
+        crate::kitty::delete_all(terminal.backend_mut());
+        render_kitty_in_pane(state, right_pane, terminal.backend_mut());
 
         match event::read().map_err(|e| e.to_string())? {
             Event::Key(KeyEvent {
@@ -94,7 +85,6 @@ fn event_loop(
             }
             Event::Resize(_, _) => {
                 terminal.clear().map_err(|e| e.to_string())?;
-                state.dirty = true;
             }
             ev => {
                 if state.textarea.input(ev) {
@@ -130,7 +120,6 @@ fn init_state(file: Option<PathBuf>) -> Result<State, String> {
         textarea,
         render: Err("not rendered yet".into()),
         error_msg: None,
-        dirty: true,
     };
     rerender(&mut state);
     Ok(state)
@@ -173,7 +162,6 @@ fn rerender(state: &mut State) {
             state.error_msg = Some(msg);
         }
     }
-    state.dirty = true;
 }
 
 fn open_editor(
@@ -260,6 +248,8 @@ fn render_kitty_in_pane(state: &State, pane: Rect, out: &mut impl Write) {
     if pane.width == 0 || pane.height == 0 {
         return;
     }
+    let (display_cols, display_rows) =
+        crate::kitty::compute_display_cells(*pw, *ph, pane.width, pane.height);
     let _ = write!(out, "\x1b[{};{}H", pane.y + 1, pane.x + 1);
-    crate::kitty::display_in_pane(rgba, *pw, *ph, pane.width, pane.height, out);
+    crate::kitty::display_in_pane(rgba, *pw, *ph, display_cols, display_rows, out);
 }

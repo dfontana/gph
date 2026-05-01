@@ -3,7 +3,8 @@ use crate::layout::{Layout, LayoutEdge, LayoutNode};
 use std::io::Write;
 
 const SCALE: f32 = 2.0;
-const BG: [u8; 4] = [255, 255, 255, 255];
+const BG: [u8; 4] = [0, 0, 0, 0];
+const NODE_BG: [u8; 4] = [255, 255, 255, 255];
 const FG: [u8; 4] = [0, 0, 0, 255];
 const EDGE_CLR: [u8; 4] = [60, 60, 60, 255];
 const LABEL_CLR: [u8; 4] = [80, 80, 80, 255];
@@ -11,6 +12,7 @@ const LABEL_CLR: [u8; 4] = [80, 80, 80, 255];
 pub fn is_supported() -> bool {
     std::env::var("KITTY_WINDOW_ID").is_ok()
         || std::env::var("TERM").ok().as_deref() == Some("xterm-kitty")
+        || std::env::var("TERM_PROGRAM").ok().as_deref() == Some("kitty")
 }
 
 pub fn render_to_rgba(layout: &Layout) -> (Vec<u8>, usize, usize) {
@@ -49,6 +51,19 @@ pub fn display_in_pane(
     let _ = out.flush();
 }
 
+pub fn compute_display_cells(px_w: usize, px_h: usize, max_cols: u16, max_rows: u16) -> (u16, u16) {
+    if px_w == 0 || px_h == 0 || max_cols == 0 || max_rows == 0 {
+        return (max_cols, max_rows);
+    }
+    const CELL_RATIO: f64 = 2.0;
+    let img_cell_w = px_w as f64;
+    let img_cell_h = px_h as f64 / CELL_RATIO;
+    let scale = (max_cols as f64 / img_cell_w).min(max_rows as f64 / img_cell_h);
+    let display_cols = ((img_cell_w * scale).ceil() as u16).min(max_cols);
+    let display_rows = ((img_cell_h * scale).ceil() as u16).min(max_rows);
+    (display_cols, display_rows)
+}
+
 pub fn delete_all(out: &mut impl Write) {
     let _ = out.write_all(b"\x1b_Ga=d,d=A\x1b\\");
     let _ = out.flush();
@@ -71,7 +86,7 @@ fn draw_node(canvas: &mut Canvas, n: &LayoutNode) {
                 Shape::Round | Shape::Stadium => 6,
                 _ => 0,
             };
-            canvas.fill_rect(x, y, w, h, BG);
+            canvas.fill_rect(x, y, w, h, NODE_BG);
             canvas.stroke_rect(x, y, w, h, FG, 2, radius);
             if matches!(&n.shape, Shape::Sub) {
                 let inner = (4.0 * SCALE) as i32;
