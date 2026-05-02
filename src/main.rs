@@ -107,8 +107,41 @@ fn render_to_file(src: &str, path: &PathBuf) -> Result<(), String> {
 }
 
 fn render_inline(src: &str) -> Result<(), String> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use ratatui_image::picker::Picker;
+    use ratatui_image::StatefulImage;
+
     let svg = gph::render_svg(src)?;
-    print!("{svg}");
+    let img = gph::svg_to_image(&svg)?;
+
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let aspect = img.height() as f32 / img.width() as f32;
+    let height = ((aspect * cols as f32 * 0.5) as u16).clamp(4, rows.saturating_sub(2));
+
+    let mut protocol = picker.new_resize_protocol(img);
+
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    terminal
+        .draw(|frame| {
+            frame.render_stateful_widget(StatefulImage::default(), frame.area(), &mut protocol);
+        })
+        .map_err(|e| e.to_string())?;
+
+    disable_raw_mode().map_err(|e| e.to_string())?;
+    println!();
     Ok(())
 }
 

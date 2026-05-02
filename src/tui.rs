@@ -15,8 +15,11 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use tui_textarea::TextArea;
 
 struct State {
@@ -24,14 +27,17 @@ struct State {
     owns_temp: bool,
     source: String,
     textarea: TextArea<'static>,
-    svg: Option<String>,
+    picker: Picker,
+    protocol: Option<StatefulProtocol>,
     error_msg: Option<String>,
     split_pct: u16,
     dragging: bool,
 }
 
 pub fn run(file: Option<PathBuf>) -> Result<(), String> {
+    // Query terminal capabilities before entering alternate screen.
     enable_raw_mode().map_err(|e| e.to_string())?;
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
@@ -39,7 +45,7 @@ pub fn run(file: Option<PathBuf>) -> Result<(), String> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
-    let mut state = init_state(file)?;
+    let mut state = init_state(file, picker)?;
     let result = event_loop(&mut terminal, &mut state);
 
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
@@ -99,7 +105,7 @@ fn event_loop(
     Ok(())
 }
 
-fn init_state(file: Option<PathBuf>) -> Result<State, String> {
+fn init_state(file: Option<PathBuf>, picker: Picker) -> Result<State, String> {
     let (file_path, owns_temp) = match file {
         Some(p) => (p, false),
         None => {
@@ -119,7 +125,8 @@ fn init_state(file: Option<PathBuf>) -> Result<State, String> {
         owns_temp,
         source,
         textarea,
-        svg: None,
+        picker,
+        protocol: None,
         error_msg: None,
         split_pct: 50,
         dragging: false,
@@ -156,13 +163,14 @@ fn save_file(state: &State) -> Result<(), String> {
 }
 
 fn rerender(state: &mut State) {
-    match crate::render_svg(&state.source) {
-        Ok(svg) => {
-            state.svg = Some(svg);
+    let result = crate::render_svg(&state.source).and_then(|svg| crate::svg_to_image(&svg));
+    match result {
+        Ok(img) => {
+            state.protocol = Some(state.picker.new_resize_protocol(img));
             state.error_msg = None;
         }
         Err(msg) => {
-            state.svg = None;
+            state.protocol = None;
             state.error_msg = Some(msg);
         }
     }
@@ -278,7 +286,7 @@ fn handle_mouse(event: MouseEvent, state: &mut State, terminal_size: Rect) {
     }
 }
 
-fn draw_frame(frame: &mut ratatui::Frame, state: &State) {
+fn draw_frame(frame: &mut ratatui::Frame, state: &mut State) {
     let area = frame.area();
     let dir = split_direction(area);
 
@@ -306,16 +314,11 @@ fn draw_frame(frame: &mut ratatui::Frame, state: &State) {
         editor_split[1],
     );
 
-    let preview_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Preview (SVG) ");
+    let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
     let preview_inner = preview_block.inner(halves[1]);
     frame.render_widget(preview_block, halves[1]);
 
-    if let Some(ref svg) = state.svg {
-        frame.render_widget(
-            Paragraph::new(svg.as_str()).wrap(Wrap { trim: false }),
-            preview_inner,
-        );
+    if let Some(ref mut protocol) = state.protocol {
+        frame.render_stateful_widget(StatefulImage::default(), preview_inner, protocol);
     }
 }
