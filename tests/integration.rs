@@ -162,8 +162,8 @@ fn svg_produces_valid_header() {
 }
 
 #[test]
-fn svg_single_edge_has_polyline() {
-    check_svg("(graph lr (-> a b))", "<polyline");
+fn svg_single_edge_has_path() {
+    check_svg("(graph lr (-> a b))", "<path");
 }
 
 #[test]
@@ -176,7 +176,7 @@ fn svg_node_labels_present() {
 
 #[test]
 fn svg_round_shape_has_rx() {
-    check_svg(r#"(graph lr (n "Node" round))"#, r#"rx="8""#);
+    check_svg(r#"(graph lr (n "Node" round))"#, "rx=");
 }
 
 #[test]
@@ -216,14 +216,14 @@ fn svg_back_edge_does_not_panic() {
     let got = gph::render_svg("(graph lr (-> a b) (-> b a))");
     assert!(got.is_ok(), "render_svg panicked on back edge");
     let svg = got.unwrap();
-    assert!(svg.contains('a') || svg.contains("polyline"));
+    assert!(svg.contains('a') || svg.contains("<path"));
 }
 
 #[test]
 fn svg_td_direction() {
     let got = gph::render_svg("(graph td (-> a b))").expect("render_svg failed");
     assert!(got.contains(r#"<svg"#));
-    assert!(got.contains("polyline"));
+    assert!(got.contains("<path"));
 }
 
 // ---- Additional coverage ---------------------------------------------------

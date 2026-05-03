@@ -12,7 +12,7 @@ enum Commands {
         #[arg(required = true)]
         files: Vec<PathBuf>,
     },
-    /// Open interactive split-pane TUI (requires Kitty terminal)
+    /// Open interactive split-pane TUI with live preview
     Tui {
         /// .gph file to edit; creates a temp file if omitted
         file: Option<PathBuf>,
@@ -22,16 +22,16 @@ enum Commands {
 }
 
 #[derive(Parser)]
-#[command(about = "Lisp DSL compiler to Mermaid, SVG, and Kitty terminal")]
+#[command(about = "Lisp DSL compiler to Mermaid, SVG, and rendered terminal graphics")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Render to SVG or Kitty instead of emitting Mermaid text
+    /// Render inline to terminal instead of emitting Mermaid text
     #[arg(short, long)]
     render: bool,
 
-    /// Write SVG output to this path (implies --render)
+    /// Write rendered SVG output to this path
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 }
@@ -101,6 +101,50 @@ fn process_md_file(path: &Path) -> bool {
     true
 }
 
+fn render_to_file(src: &str, path: &PathBuf) -> Result<(), String> {
+    let svg = gph::render_svg(src)?;
+    std::fs::write(path, svg).map_err(|e| format!("error writing '{}': {e}", path.display()))
+}
+
+fn render_inline(src: &str) -> Result<(), String> {
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use ratatui_image::picker::Picker;
+    use ratatui_image::StatefulImage;
+
+    let svg = gph::render_svg(src)?;
+    let img = gph::svg_to_image(&svg)?;
+
+    enable_raw_mode().map_err(|e| e.to_string())?;
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
+    let (cols, rows) = size().unwrap_or((80, 24));
+    let aspect = img.height() as f32 / img.width() as f32;
+    let height = ((aspect * cols as f32 * 0.5) as u16).clamp(4, rows.saturating_sub(2));
+
+    let mut protocol = picker.new_resize_protocol(img);
+
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    terminal
+        .draw(|frame| {
+            frame.render_stateful_widget(StatefulImage::default(), frame.area(), &mut protocol);
+        })
+        .map_err(|e| e.to_string())?;
+
+    disable_raw_mode().map_err(|e| e.to_string())?;
+    println!();
+    Ok(())
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -113,10 +157,6 @@ fn main() {
             return;
         }
         Some(Commands::Tui { file }) => {
-            if !gph::kitty_supported() {
-                eprintln!("error: `gph tui` requires a Kitty terminal (KITTY_WINDOW_ID not set)");
-                process::exit(1);
-            }
             if let Err(e) = gph::tui::run(file) {
                 eprintln!("tui error: {e}");
                 process::exit(1);
@@ -141,8 +181,6 @@ fn main() {
         None => {}
     }
 
-    let render_mode = cli.render || cli.output.is_some();
-
     let mut buf = String::new();
     io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
         eprintln!("error reading stdin: {}", e);
@@ -150,30 +188,15 @@ fn main() {
     });
     let src = buf;
 
-    if render_mode {
-        match cli.output {
-            Some(path) => match gph::render_svg(&src) {
-                Ok(svg) => {
-                    if let Err(e) = std::fs::write(&path, svg) {
-                        eprintln!("error writing '{}': {}", path.display(), e);
-                        process::exit(1);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("{}", e);
-                    process::exit(1);
-                }
-            },
-            None => {
-                if !gph::kitty_supported() {
-                    eprintln!("error: --render requires --output <path> or a Kitty terminal (KITTY_WINDOW_ID not set)");
-                    process::exit(1);
-                }
-                if let Err(e) = gph::render_kitty(&src) {
-                    eprintln!("{}", e);
-                    process::exit(1);
-                }
-            }
+    if let Some(ref path) = cli.output {
+        if let Err(e) = render_to_file(&src, path) {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    } else if cli.render {
+        if let Err(e) = render_inline(&src) {
+            eprintln!("{e}");
+            process::exit(1);
         }
     } else {
         match gph::compile(&src) {

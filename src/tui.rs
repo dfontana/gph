@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, Write};
+use std::io::{self};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -17,6 +17,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use tui_textarea::TextArea;
 
 struct State {
@@ -24,25 +27,27 @@ struct State {
     owns_temp: bool,
     source: String,
     textarea: TextArea<'static>,
-    render: Result<(Vec<u8>, usize, usize), String>,
+    picker: Picker,
+    protocol: Option<StatefulProtocol>,
     error_msg: Option<String>,
     split_pct: u16,
     dragging: bool,
 }
 
 pub fn run(file: Option<PathBuf>) -> Result<(), String> {
-    let mut state = init_state(file)?;
-
+    // Query terminal capabilities before entering alternate screen.
     enable_raw_mode().map_err(|e| e.to_string())?;
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(|e| e.to_string())?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(|e| e.to_string())?;
 
+    let mut state = init_state(file, picker)?;
     let result = event_loop(&mut terminal, &mut state);
 
-    crate::kitty::delete_all(terminal.backend_mut());
     let _ = execute!(terminal.backend_mut(), DisableMouseCapture);
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -59,16 +64,9 @@ fn event_loop(
     state: &mut State,
 ) -> Result<(), String> {
     loop {
-        let sz = terminal.size().map_err(|e| e.to_string())?;
-        let size = Rect::new(0, 0, sz.width, sz.height);
-        let right_pane = compute_right_pane_inner(size, state.split_pct);
-
         terminal
             .draw(|frame| draw_frame(frame, state))
             .map_err(|e| e.to_string())?;
-
-        crate::kitty::delete_all(terminal.backend_mut());
-        render_kitty_in_pane(state, right_pane, terminal.backend_mut());
 
         match event::read().map_err(|e| e.to_string())? {
             Event::Key(KeyEvent {
@@ -81,7 +79,6 @@ fn event_loop(
                 modifiers: KeyModifiers::CONTROL,
                 ..
             }) => break,
-            // Ctrl-E: open $EDITOR (overrides Emacs end-of-line; use End key instead)
             Event::Key(KeyEvent {
                 code: KeyCode::Char('e'),
                 modifiers: KeyModifiers::CONTROL,
@@ -93,7 +90,8 @@ fn event_loop(
                 terminal.clear().map_err(|e| e.to_string())?;
             }
             Event::Mouse(mouse_event) => {
-                handle_mouse(mouse_event, state, size);
+                let sz = terminal.size().map_err(|e| e.to_string())?;
+                handle_mouse(mouse_event, state, Rect::new(0, 0, sz.width, sz.height));
             }
             ev => {
                 if state.textarea.input(ev) {
@@ -107,7 +105,7 @@ fn event_loop(
     Ok(())
 }
 
-fn init_state(file: Option<PathBuf>) -> Result<State, String> {
+fn init_state(file: Option<PathBuf>, picker: Picker) -> Result<State, String> {
     let (file_path, owns_temp) = match file {
         Some(p) => (p, false),
         None => {
@@ -127,7 +125,8 @@ fn init_state(file: Option<PathBuf>) -> Result<State, String> {
         owns_temp,
         source,
         textarea,
-        render: Err("not rendered yet".into()),
+        picker,
+        protocol: None,
         error_msg: None,
         split_pct: 50,
         dragging: false,
@@ -164,12 +163,14 @@ fn save_file(state: &State) -> Result<(), String> {
 }
 
 fn rerender(state: &mut State) {
-    match crate::render_to_rgba(&state.source) {
-        Ok(data) => {
-            state.render = Ok(data);
+    let result = crate::render_svg(&state.source).and_then(|svg| crate::svg_to_image(&svg));
+    match result {
+        Ok(img) => {
+            state.protocol = Some(state.picker.new_resize_protocol(img));
             state.error_msg = None;
         }
         Err(msg) => {
+            state.protocol = None;
             state.error_msg = Some(msg);
         }
     }
@@ -219,8 +220,6 @@ fn open_editor(
 }
 
 fn split_direction(area: Rect) -> Direction {
-    // Prefer real pixel dimensions so the split matches the visual aspect ratio.
-    // Fall back to a 2:1 cell approximation if the terminal doesn't report pixel size.
     let taller = if let Ok(ws) = window_size() {
         if ws.width > 0 && ws.height > 0 {
             ws.height > ws.width
@@ -287,7 +286,7 @@ fn handle_mouse(event: MouseEvent, state: &mut State, terminal_size: Rect) {
     }
 }
 
-fn draw_frame(frame: &mut ratatui::Frame, state: &State) {
+fn draw_frame(frame: &mut ratatui::Frame, state: &mut State) {
     let area = frame.area();
     let dir = split_direction(area);
 
@@ -315,30 +314,11 @@ fn draw_frame(frame: &mut ratatui::Frame, state: &State) {
         editor_split[1],
     );
 
-    // Preview border — kitty renders inside after the frame flush
-    frame.render_widget(
-        Block::default().borders(Borders::ALL).title(" Preview "),
-        halves[1],
-    );
-}
+    let preview_block = Block::default().borders(Borders::ALL).title(" Preview ");
+    let preview_inner = preview_block.inner(halves[1]);
+    frame.render_widget(preview_block, halves[1]);
 
-fn compute_right_pane_inner(size: Rect, split_pct: u16) -> Rect {
-    let halves = Layout::default()
-        .direction(split_direction(size))
-        .constraints(make_split_constraints(split_pct))
-        .split(size);
-    Block::default().borders(Borders::ALL).inner(halves[1])
-}
-
-fn render_kitty_in_pane(state: &State, pane: Rect, out: &mut impl Write) {
-    let Ok((rgba, pw, ph)) = &state.render else {
-        return;
-    };
-    if pane.width == 0 || pane.height == 0 {
-        return;
+    if let Some(ref mut protocol) = state.protocol {
+        frame.render_stateful_widget(StatefulImage::default(), preview_inner, protocol);
     }
-    let (display_cols, display_rows) =
-        crate::kitty::compute_display_cells(*pw, *ph, pane.width, pane.height);
-    let _ = write!(out, "\x1b[{};{}H", pane.y + 1, pane.x + 1);
-    crate::kitty::display_in_pane(rgba, *pw, *ph, display_cols, display_rows, out);
 }
