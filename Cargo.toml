@@ -1,7 +1,10 @@
 [package]
 name = "gph"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
+description = "A Kitty-native live Mermaid editor and SVG exporter"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "gph"
@@ -11,7 +14,9 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
-clap      = { version = "4", features = ["derive"] }
-ratatui   = { version = "0.29", default-features = false, features = ["crossterm"] }
-crossterm = { version = "0.28", default-features = false, features = ["events"] }
-tui-textarea = { version = "0.7.0", features = ["crossterm"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", default-features = false, features = ["events"] }
+merman = { version = "=0.8.0-alpha.3", default-features = false, features = ["core-full", "core-host", "raster"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
+ratatui-textarea = { version = "0.9", features = ["crossterm"] }
