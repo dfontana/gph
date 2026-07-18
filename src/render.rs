@@ -1,0 +1,167 @@
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+
+use merman::render::{
+    HeadlessRenderer,
+    raster::{RasterFitBox, RasterOptions},
+};
+
+const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
+static SVG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static SVG_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
+
+/// The sole boundary between gph and Mermaid parsing, layout, and rendering.
+pub struct Renderer {
+    inner: HeadlessRenderer,
+}
+
+impl Default for Renderer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Renderer {
+    pub fn new() -> Self {
+        Self {
+            inner: HeadlessRenderer::new()
+                .with_strict_parsing()
+                .with_diagram_id(PREVIEW_DIAGRAM_ID),
+        }
+    }
+
+    pub fn svg(&self, source: &str) -> Result<String, String> {
+        self.inner
+            .clone()
+            .with_diagram_id(&next_svg_diagram_id())
+            .render_svg_sync(strip_bom(source))
+            .map_err(|error| format!("render failed: {error}"))?
+            .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
+    }
+
+    pub fn png(&self, source: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
+        let options = RasterOptions::default()
+            .with_fit_to(RasterFitBox::contain(width.max(1), height.max(1)));
+        self.inner
+            .render_png_sync(strip_bom(source), &options)
+            .map_err(|error| format!("render failed: {error}"))?
+            .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
+    }
+}
+
+fn next_svg_diagram_id() -> String {
+    let nonce = *SVG_PROCESS_NONCE.get_or_init(entropy_nonce);
+    next_svg_diagram_id_with(nonce, &SVG_ID_SEQUENCE)
+}
+
+fn next_svg_diagram_id_with(nonce: u64, sequence: &AtomicU64) -> String {
+    svg_diagram_id(nonce, sequence.fetch_add(1, Ordering::Relaxed))
+}
+
+fn svg_diagram_id(nonce: u64, sequence: u64) -> String {
+    format!("gph-svg-{nonce:016x}-{sequence}")
+}
+
+fn entropy_nonce() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(std::process::id().into());
+    hasher.finish()
+}
+
+fn strip_bom(source: &str) -> &str {
+    source.strip_prefix('\u{feff}').unwrap_or(source)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    const FLOWCHART: &str = "flowchart TD\n  A[Start] --> B[Done]\n";
+
+    #[test]
+    fn renders_svg() {
+        let svg = Renderer::new().svg(FLOWCHART).unwrap();
+        assert!(svg.starts_with("<svg"), "{svg}");
+        assert!(svg.contains("Start"));
+    }
+
+    #[test]
+    fn svg_ids_are_unique_for_distinct_process_nonces_and_prefix_definitions() {
+        let first = svg_diagram_id(0x1234_5678_90ab_cdef, 0);
+        let second = svg_diagram_id(0xfedc_ba09_8765_4321, 0);
+
+        assert_ne!(first, second);
+        assert_ne!(
+            format!("{first}-drop-shadow"),
+            format!("{second}-drop-shadow")
+        );
+        assert_ne!(
+            format!("{first}_flowchart-v2-pointEnd"),
+            format!("{second}_flowchart-v2-pointEnd")
+        );
+    }
+
+    #[test]
+    fn svg_ids_are_unique_within_a_process() {
+        let sequence = AtomicU64::new(0);
+        assert_ne!(
+            next_svg_diagram_id_with(0x1234_5678_90ab_cdef, &sequence),
+            next_svg_diagram_id_with(0x1234_5678_90ab_cdef, &sequence)
+        );
+    }
+
+    #[test]
+    fn svg_exports_have_unique_prefixed_definition_ids() {
+        let renderer = Renderer::new();
+        let first = renderer.svg(FLOWCHART).unwrap();
+        let second = renderer.svg(FLOWCHART).unwrap();
+        let first_id = root_id(&first);
+        let second_id = root_id(&second);
+
+        assert_ne!(first_id, second_id);
+        for (svg, id) in [(&first, first_id), (&second, second_id)] {
+            assert!(svg.contains(&format!("id=\"{id}-drop-shadow\"")));
+            assert!(svg.contains(&format!("id=\"{id}_flowchart-v2-pointEnd\"")));
+            assert!(svg.contains(&format!("url(#{id}_flowchart-v2-pointEnd)")));
+        }
+    }
+
+    fn root_id(svg: &str) -> &str {
+        let prefix = "<svg id=\"";
+        let start = svg.find(prefix).expect("SVG root ID") + prefix.len();
+        let end = svg[start..].find('\"').expect("end of SVG root ID") + start;
+        &svg[start..end]
+    }
+
+    #[test]
+    fn renders_png_for_preview() {
+        let png = Renderer::new().png(FLOWCHART, 640, 480).unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn renders_bom_prefixed_svg() {
+        let svg = Renderer::new()
+            .svg(&format!("\u{feff}{FLOWCHART}"))
+            .unwrap();
+        assert!(svg.starts_with("<svg"), "{svg}");
+    }
+
+    #[test]
+    fn renders_bom_prefixed_png() {
+        let png = Renderer::new()
+            .png(&format!("\u{feff}{FLOWCHART}"), 640, 480)
+            .unwrap();
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn rejects_non_diagrams() {
+        assert!(Renderer::new().svg("not Mermaid").is_err());
+    }
+}
