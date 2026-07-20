@@ -245,7 +245,7 @@ fn preview_pane(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
-fn pane_pixels(pane: Rect) -> (u32, u32) {
+pub(crate) fn pane_pixels(pane: Rect) -> (u32, u32) {
     let fallback = (
         (u32::from(pane.width) * 8).max(1),
         (u32::from(pane.height) * 16).max(1),
@@ -262,7 +262,7 @@ fn pane_pixels(pane: Rect) -> (u32, u32) {
     )
 }
 
-fn cleanup(
+pub(crate) fn cleanup(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     image_id: kitty::ImageId,
 ) -> Result<(), String> {
@@ -272,7 +272,10 @@ fn cleanup(
     combine(image, raw)
 }
 
-fn combine(primary: Result<(), String>, cleanup: Result<(), String>) -> Result<(), String> {
+pub(crate) fn combine(
+    primary: Result<(), String>,
+    cleanup: Result<(), String>,
+) -> Result<(), String> {
     match (primary, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),

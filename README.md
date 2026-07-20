@@ -32,6 +32,40 @@ screen. Invalid Mermaid leaves the
 last valid preview visible and reports the error in the preview border. Press
 `Ctrl-C` or `Ctrl-Q` to quit.
 
+## Preview unsaved Helix buffers
+
+In a Kitty pane at the workspace root, start the preview daemon before opening
+Helix. LSP preview support is Unix-only because it uses Unix-domain sockets, and
+requires a non-empty `XDG_RUNTIME_DIR`; `gph lsp` stores per-user runtime files
+there. Helix must be launched from the same workspace and user session.
+
+```sh
+gph lsp
+```
+
+Then add this once to Helix's `languages.toml` (alongside `merman-lsp`):
+
+```toml
+[language-server.gph-preview]
+command = "gph"
+args = ["lsp-connect"]
+
+[[language]]
+name = "mermaid"
+language-servers = ["merman-lsp", "gph-preview"]
+```
+
+Helix starts `gph lsp-connect` automatically for each Mermaid buffer; it bridges
+Helix's standard input/output to that workspace socket. The daemon shows the
+most recently changed open document and uses only the full unsaved text supplied
+by LSP `didOpen` and `didChange` notifications—it never reads the buffer from
+disk. Closing a buffer returns the preview to the next most recent open
+document, and renders debounce briefly after the final edit. `gph` advertises
+LSP full text synchronization (`openClose` and `change = 1`) only, so
+`merman-lsp` remains the diagnostics provider. Quit the Kitty preview pane with
+`Ctrl-Q` or `Ctrl-C`; the socket is removed and a later Helix connection reports
+that `gph lsp` needs to be started again.
+
 ## Render files
 
 ```sh

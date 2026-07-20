@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
 mod kitty;
+mod lsp;
 // MML is intentionally not a CLI filetype yet; keep it compiled for its future
 // shorthand integration without exposing a separate library target.
 #[allow(dead_code)]
 mod mml;
+mod preview;
 mod render;
 mod watch;
 
@@ -28,6 +30,10 @@ enum Command {
         /// Mermaid source file to watch.
         file: PathBuf,
     },
+    /// Run the Kitty workspace preview daemon for unsaved LSP documents.
+    Lsp,
+    /// Bridge an LSP client's stdin/stdout to the workspace preview daemon.
+    LspConnect,
     /// Render Mermaid source as SVG, PNG, JPEG, or PDF.
     #[command(visible_alias = "export")]
     Render {
@@ -54,6 +60,8 @@ enum OutputFormat {
 fn main() {
     let result = match Cli::parse().command {
         Command::Watch { file } => watch(file),
+        Command::Lsp => lsp::run_daemon(),
+        Command::LspConnect => lsp::run_connect(),
         Command::Render {
             input,
             output,
