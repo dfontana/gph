@@ -1,23 +1,17 @@
 use std::collections::BTreeMap;
-use std::io;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use crossterm::event::{self, Event};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::kitty;
+use crate::preview_ui::{
+    PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event, pane_pixels,
+};
 use crate::render::Renderer;
-use crate::watch::{cleanup, combine, pane_pixels};
 
 /// A document update received from one LSP client connection.
 #[derive(Debug)]
@@ -57,10 +51,8 @@ struct LspPreviewState {
     documents: BTreeMap<(u64, String), PreviewDocument>,
     sequence: u64,
     renderer: Renderer,
-    image_id: kitty::ImageId,
-    preview: Option<Vec<u8>>,
+    image: PreviewImage,
     render_error: Option<String>,
-    graphics_dirty: bool,
 }
 
 impl LspPreviewState {
@@ -69,10 +61,8 @@ impl LspPreviewState {
             documents: BTreeMap::new(),
             sequence: 0,
             renderer: Renderer::new(),
-            image_id: kitty::new_image_id(),
-            preview: None,
+            image: PreviewImage::new(),
             render_error: None,
-            graphics_dirty: true,
         }
     }
 
@@ -174,12 +164,11 @@ impl LspPreviewState {
     }
 
     fn show_preview(&mut self, png: Vec<u8>) {
-        self.graphics_dirty |= self.preview.as_ref() != Some(&png);
-        self.preview = Some(png);
+        self.image.show(png);
     }
 
     fn clear_preview(&mut self) {
-        self.graphics_dirty |= self.preview.take().is_some();
+        self.image.clear();
     }
 
     fn status(&self) -> String {
@@ -196,37 +185,14 @@ impl LspPreviewState {
 /// Run the dedicated Kitty pane that previews the most recently changed LSP document.
 pub fn run_lsp_preview(receiver: Receiver<PreviewEvent>) -> Result<(), String> {
     let mut state = LspPreviewState::new();
-    enable_raw_mode().map_err(|error| format!("cannot enable raw mode: {error}"))?;
-    let mut stdout = io::stdout();
-    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
-        let cleanup = disable_raw_mode().map_err(|cleanup| cleanup.to_string());
-        return combine(
-            Err(format!("cannot enter alternate screen: {error}")),
-            cleanup,
-        );
-    }
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = match Terminal::new(backend) {
-        Ok(terminal) => terminal,
-        Err(error) => {
-            let mut stdout = io::stdout();
-            let leave =
-                execute!(stdout, LeaveAlternateScreen).map_err(|cleanup| cleanup.to_string());
-            let raw = disable_raw_mode().map_err(|cleanup| cleanup.to_string());
-            return combine(
-                Err(format!("cannot initialize terminal: {error}")),
-                combine(leave, raw),
-            );
-        }
-    };
-
-    let result = lsp_preview_loop(&mut terminal, &receiver, &mut state);
-    let cleanup = cleanup(&mut terminal, state.image_id);
+    let mut session = TerminalSession::alternate()?;
+    let result = lsp_preview_loop(session.terminal(), &receiver, &mut state);
+    let cleanup = session.cleanup(&mut state.image);
     combine(result, cleanup)
 }
 
 fn lsp_preview_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut PreviewTerminal,
     receiver: &Receiver<PreviewEvent>,
     state: &mut LspPreviewState,
 ) -> Result<(), String> {
@@ -234,7 +200,6 @@ fn lsp_preview_loop(
     let mut dirty = true;
     let mut preview_dirty = true;
     let mut deadline = None;
-    let mut image_displayed = false;
 
     loop {
         let mut changed = false;
@@ -270,15 +235,10 @@ fn lsp_preview_loop(
                 .map_err(|error| error.to_string())?;
             let size = terminal.size().map_err(|error| error.to_string())?;
             let pane = lsp_preview_panes(Rect::new(0, 0, size.width, size.height)).preview;
-            display_preview_if_dirty(
-                state.image_id,
-                state.preview.as_deref(),
-                pane,
-                &mut image_displayed,
-                &mut state.graphics_dirty,
-                terminal.backend_mut(),
-            )
-            .map_err(|error| format!("Kitty preview failed: {error}"))?;
+            state
+                .image
+                .display_if_dirty(pane, terminal.backend_mut())
+                .map_err(|error| format!("Kitty preview failed: {error}"))?;
             dirty = false;
         }
 
@@ -291,20 +251,16 @@ fn lsp_preview_loop(
         if !event::poll(wait).map_err(|error| error.to_string())? {
             continue;
         }
-        match event::read().map_err(|error| error.to_string())? {
-            Event::Key(KeyEvent {
-                code: KeyCode::Char('c') | KeyCode::Char('q'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            }) => return Ok(()),
-            Event::Resize(_, _) => {
-                terminal.clear().map_err(|error| error.to_string())?;
-                preview_dirty = true;
-                deadline = Some(Instant::now());
-                state.graphics_dirty = true;
-                dirty = true;
-            }
-            _ => {}
+        let event = event::read().map_err(|error| error.to_string())?;
+        if is_quit_event(&event) {
+            return Ok(());
+        }
+        if matches!(event, Event::Resize(_, _)) {
+            terminal.clear().map_err(|error| error.to_string())?;
+            preview_dirty = true;
+            deadline = Some(Instant::now());
+            state.image.mark_dirty();
+            dirty = true;
         }
     }
 }
@@ -345,51 +301,6 @@ fn draw_lsp_preview(frame: &mut ratatui::Frame, state: &LspPreviewState) {
         Paragraph::new(Line::from(Span::styled(state.status(), style))),
         panes.status,
     );
-}
-
-fn display_preview_if_dirty(
-    image_id: kitty::ImageId,
-    preview: Option<&[u8]>,
-    pane: Rect,
-    image_displayed: &mut bool,
-    graphics_dirty: &mut bool,
-    out: &mut impl io::Write,
-) -> io::Result<()> {
-    if !*graphics_dirty {
-        return Ok(());
-    }
-    display_preview(image_id, preview, pane, image_displayed, out)?;
-    *graphics_dirty = false;
-    Ok(())
-}
-
-fn display_preview(
-    image_id: kitty::ImageId,
-    preview: Option<&[u8]>,
-    pane: Rect,
-    image_displayed: &mut bool,
-    out: &mut impl io::Write,
-) -> io::Result<()> {
-    if pane.width == 0 || pane.height == 0 {
-        if *image_displayed {
-            kitty::delete_image(image_id, out)?;
-            *image_displayed = false;
-        }
-        return Ok(());
-    }
-
-    match preview {
-        Some(png) => {
-            kitty::display_png(image_id, png, pane, out)?;
-            *image_displayed = true;
-        }
-        None if *image_displayed => {
-            kitty::delete_image(image_id, out)?;
-            *image_displayed = false;
-        }
-        None => {}
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -451,7 +362,7 @@ mod tests {
             version: 1,
         });
         state.render((100, 100));
-        let preview_a = state.preview.clone().unwrap();
+        let preview_a = state.image.png().unwrap().to_vec();
 
         state.apply(PreviewEvent::Set {
             client: 2,
@@ -460,12 +371,12 @@ mod tests {
             version: 1,
         });
         state.render((100, 100));
-        assert!(state.preview.is_none());
+        assert!(state.image.png().is_none());
         assert!(state.render_error.is_some());
 
         state.render((200, 100));
-        assert!(state.preview.is_none());
-        assert_ne!(state.preview.as_ref(), Some(&preview_a));
+        assert!(state.image.png().is_none());
+        assert_ne!(state.image.png(), Some(preview_a.as_slice()));
     }
 
     #[test]
@@ -497,7 +408,7 @@ mod tests {
         let cache = state.documents[&key].cache.as_ref().unwrap();
         assert_eq!(cache.source, "flowchart TD\nB --> C\n");
         assert_eq!(cache.size, (200, 100));
-        assert_eq!(state.preview.as_deref(), Some(cache.png.as_slice()));
+        assert_eq!(state.image.png(), Some(cache.png.as_slice()));
         assert!(state.render_error.is_some());
     }
 }

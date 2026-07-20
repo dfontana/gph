@@ -7,6 +7,7 @@ mod lsp;
 #[allow(dead_code)]
 mod mml;
 mod preview;
+mod preview_ui;
 mod render;
 mod watch;
 
