@@ -17,7 +17,7 @@ use std::process;
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(about = "Kitty-native Mermaid previewer and renderer")]
+#[command(version, about = "Kitty-native Mermaid previewer and renderer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
