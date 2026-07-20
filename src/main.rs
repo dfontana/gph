@@ -1,12 +1,18 @@
-use std::fs::OpenOptions;
-use std::io::{self, Read, Write};
+#![forbid(unsafe_code)]
+
+mod files;
+mod kitty;
+mod render;
+mod watch;
+
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(about = "Kitty-native live Mermaid editor and SVG exporter")]
+#[command(about = "Kitty-native Mermaid previewer and SVG exporter")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -14,13 +20,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Edit Mermaid source with a live Kitty preview.
-    Edit {
-        /// Mermaid source file to edit.
+    /// Watch Mermaid source with a live Kitty preview.
+    Watch {
+        /// Mermaid source file to watch.
         file: PathBuf,
-        /// Create FILE with a small Mermaid starter; fail if it already exists.
-        #[arg(long)]
-        create: bool,
     },
     /// Render Mermaid source as an SVG file.
     Export {
@@ -34,7 +37,7 @@ enum Command {
 
 fn main() {
     let result = match Cli::parse().command {
-        Command::Edit { file, create } => edit(file, create),
+        Command::Watch { file } => watch(file),
         Command::Export { input, output } => export(&input, &output),
     };
     if let Err(error) = result {
@@ -43,38 +46,13 @@ fn main() {
     }
 }
 
-fn edit(file: PathBuf, create: bool) -> Result<(), String> {
-    if !gph::kitty::is_available() {
+fn watch(file: PathBuf) -> Result<(), String> {
+    if !kitty::is_available() {
         return Err(
-            "`gph edit` requires Kitty (set KITTY_WINDOW_ID or TERM=xterm-kitty)".to_string(),
+            "`gph watch` requires Kitty (set KITTY_WINDOW_ID or TERM=xterm-kitty)".to_string(),
         );
     }
-    if create {
-        create_file(&file)?;
-    }
-    if !file.is_file() {
-        return Err(format!(
-            "'{}' is not a readable Mermaid file",
-            file.display()
-        ));
-    }
-    gph::tui::run(file)
-}
-
-fn create_file(path: &Path) -> Result<(), String> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("cannot create '{}': {error}", path.display()))?;
-    let result = file
-        .write_all(b"flowchart TD\n  A[Start] --> B[Done]\n")
-        .and_then(|()| file.flush());
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(path);
-        return Err(format!("cannot create '{}': {error}", path.display()));
-    }
-    Ok(())
+    watch::run(file)
 }
 
 fn export(input: &Path, output: &Path) -> Result<(), String> {
@@ -88,8 +66,8 @@ fn export(input: &Path, output: &Path) -> Result<(), String> {
         ));
     }
     let source = read_input(input)?;
-    let svg = gph::render::Renderer::new().svg(&source)?;
-    gph::files::write_atomically(output, &svg)
+    let svg = render::Renderer::new().svg(&source)?;
+    files::write_atomically(output, &svg)
         .map_err(|error| format!("cannot write '{}': {error}", output.display()))
 }
 
@@ -108,7 +86,8 @@ fn read_input(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::read_input;
+    use super::{Cli, Command, read_input};
+    use clap::Parser;
     use std::path::Path;
 
     #[test]
@@ -128,12 +107,12 @@ mod tests {
     }
 
     #[test]
-    fn create_file_never_overwrites_an_existing_file() {
-        let path = temporary_path("existing");
-        std::fs::write(&path, "existing").unwrap();
-        assert!(super::create_file(&path).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing");
-        std::fs::remove_file(path).unwrap();
+    fn parses_watch_command() {
+        let cli = Cli::try_parse_from(["gph", "watch", "diagram.mmd"]).unwrap();
+        let Command::Watch { file } = cli.command else {
+            panic!("expected watch command");
+        };
+        assert_eq!(file, Path::new("diagram.mmd"));
     }
 
     #[test]

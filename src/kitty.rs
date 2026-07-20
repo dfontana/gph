@@ -37,13 +37,55 @@ fn is_available_with(
         || term_program == Some(std::ffi::OsStr::new("kitty"))
 }
 
-/// Remove only this editor instance's image, never Kitty's whole image store.
+/// Remove only this preview instance's image, never Kitty's whole image store.
 pub fn delete_image(image_id: ImageId, out: &mut impl Write) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,d=I,i={},q=2;\x1b\\", image_id.0)?;
     out.flush()
 }
 
-/// Replace this editor instance's image and place it at its natural aspect ratio in `pane`.
+/// Return the cell-aligned location that centers a PNG within `pane`.
+///
+/// Kitty places a natural-size image from the cursor cell. Rasterized previews can
+/// be smaller than their available pane, so position their top-left cell here rather
+/// than pinning every image to the pane's upper-left corner.
+pub fn centered_pane(pane: Rect, png: &[u8]) -> Rect {
+    let Some((image_width, image_height)) = png_dimensions(png) else {
+        return pane;
+    };
+    let Ok(terminal) = crossterm::terminal::window_size() else {
+        return pane;
+    };
+    if terminal.columns == 0 || terminal.rows == 0 || terminal.width == 0 || terminal.height == 0 {
+        return pane;
+    }
+    let cell_width = u32::from(terminal.width) / u32::from(terminal.columns);
+    let cell_height = u32::from(terminal.height) / u32::from(terminal.rows);
+    center_png(pane, image_width, image_height, cell_width, cell_height)
+}
+
+fn center_png(
+    pane: Rect,
+    image_width: u32,
+    image_height: u32,
+    cell_width: u32,
+    cell_height: u32,
+) -> Rect {
+    if cell_width == 0 || cell_height == 0 {
+        return pane;
+    }
+    let image_columns = image_width.div_ceil(cell_width).min(u32::from(pane.width)) as u16;
+    let image_rows = image_height
+        .div_ceil(cell_height)
+        .min(u32::from(pane.height)) as u16;
+    Rect::new(
+        pane.x + (pane.width - image_columns) / 2,
+        pane.y + (pane.height - image_rows) / 2,
+        image_columns,
+        image_rows,
+    )
+}
+
+/// Replace this preview instance's image and place it at its natural aspect ratio in `pane`.
 ///
 /// The caller rasterizes the image to fit the pane. Omitting Kitty's cell dimensions
 /// here lets Kitty derive the placement from the PNG's pixels instead of stretching it
@@ -70,6 +112,16 @@ pub fn display_png(
     out.flush()
 }
 
+fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    if png.get(..8)? != PNG_SIGNATURE {
+        return None;
+    }
+    let width = u32::from_be_bytes(png.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(png.get(20..24)?.try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 fn upload_png(image_id: ImageId, png: &[u8], out: &mut impl Write) -> io::Result<()> {
     let encoded = STANDARD.encode(png);
     let chunks: Vec<&[u8]> = encoded.as_bytes().chunks(CHUNK_SIZE).collect();
@@ -92,8 +144,8 @@ fn upload_png(image_id: ImageId, png: &[u8], out: &mut impl Write) -> io::Result
 mod tests {
     use super::*;
 
-    const FIRST_EDITOR_IMAGE: ImageId = ImageId(101);
-    const SECOND_EDITOR_IMAGE: ImageId = ImageId(202);
+    const FIRST_PREVIEW_IMAGE: ImageId = ImageId(101);
+    const SECOND_PREVIEW_IMAGE: ImageId = ImageId(202);
 
     #[test]
     fn accepts_kitty_term_without_window_id() {
@@ -123,15 +175,31 @@ mod tests {
     }
 
     #[test]
-    fn generates_nonzero_editor_image_ids() {
+    fn generates_nonzero_preview_image_ids() {
         assert_ne!(new_image_id().0, 0);
+    }
+
+    #[test]
+    fn centers_natural_size_pngs_in_the_available_pane() {
+        assert_eq!(
+            center_png(Rect::new(10, 5, 80, 20), 160, 80, 8, 16),
+            Rect::new(40, 12, 20, 5),
+        );
+    }
+
+    #[test]
+    fn large_pngs_stay_within_the_available_pane() {
+        assert_eq!(
+            center_png(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16),
+            Rect::new(10, 5, 80, 20),
+        );
     }
 
     #[test]
     fn displays_a_png_at_its_natural_aspect_ratio_in_the_requested_pane() {
         let mut bytes = Vec::new();
         display_png(
-            FIRST_EDITOR_IMAGE,
+            FIRST_PREVIEW_IMAGE,
             b"png",
             Rect::new(42, 3, 50, 18),
             &mut bytes,
@@ -148,38 +216,38 @@ mod tests {
     }
 
     #[test]
-    fn editor_protocol_commands_are_isolated_by_image_id() {
+    fn preview_protocol_commands_are_isolated_by_image_id() {
         let mut first = Vec::new();
         display_png(
-            FIRST_EDITOR_IMAGE,
+            FIRST_PREVIEW_IMAGE,
             b"png",
             Rect::new(0, 0, 1, 1),
             &mut first,
         )
         .unwrap();
-        delete_image(FIRST_EDITOR_IMAGE, &mut first).unwrap();
+        delete_image(FIRST_PREVIEW_IMAGE, &mut first).unwrap();
 
         let mut second = Vec::new();
         display_png(
-            SECOND_EDITOR_IMAGE,
+            SECOND_PREVIEW_IMAGE,
             b"png",
             Rect::new(1, 1, 2, 3),
             &mut second,
         )
         .unwrap();
-        delete_image(SECOND_EDITOR_IMAGE, &mut second).unwrap();
+        delete_image(SECOND_PREVIEW_IMAGE, &mut second).unwrap();
 
         let first = String::from_utf8(first).unwrap();
         let second = String::from_utf8(second).unwrap();
-        assert_protocol_uses_only(&first, FIRST_EDITOR_IMAGE, SECOND_EDITOR_IMAGE);
-        assert_protocol_uses_only(&second, SECOND_EDITOR_IMAGE, FIRST_EDITOR_IMAGE);
+        assert_protocol_uses_only(&first, FIRST_PREVIEW_IMAGE, SECOND_PREVIEW_IMAGE);
+        assert_protocol_uses_only(&second, SECOND_PREVIEW_IMAGE, FIRST_PREVIEW_IMAGE);
     }
 
     #[test]
     fn splits_large_payloads_without_global_deletion() {
         let mut bytes = Vec::new();
         display_png(
-            FIRST_EDITOR_IMAGE,
+            FIRST_PREVIEW_IMAGE,
             &vec![0; 4_000],
             Rect::new(0, 0, 1, 1),
             &mut bytes,
