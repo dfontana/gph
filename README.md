@@ -40,10 +40,12 @@ last valid preview visible and reports the error in the preview border. Press
 
 ## Preview unsaved Helix buffers
 
-In a Kitty pane at the workspace root, start the preview daemon before opening
-Helix. LSP preview support is Unix-only because it uses Unix-domain sockets, and
-requires a non-empty `XDG_RUNTIME_DIR`; `gph lsp` stores per-user runtime files
-there. Helix must be launched from the same workspace and user session.
+In a Kitty pane, start the preview daemon before opening Helix. LSP preview
+support is Unix-only because it uses Unix-domain sockets. A single daemon per
+user serves every workspace, so you can start it from any directory and connect
+from anywhere in the same user session. `gph lsp` stores its socket in a
+per-user runtime directory (`XDG_RUNTIME_DIR` on Linux, `~/Library/Caches` on
+macOS).
 
 ```sh
 gph lsp
@@ -62,8 +64,8 @@ language-servers = ["merman-lsp", "gph-preview"]
 ```
 
 Helix starts `gph lsp-connect` automatically for each Mermaid buffer; it bridges
-Helix's standard input/output to that workspace socket. The daemon shows the
-most recently changed open document and uses only the full unsaved text supplied
+Helix's standard input/output to the shared daemon socket. The daemon shows the
+most recently changed open document across every connected workspace and uses only the full unsaved text supplied
 by LSP `didOpen` and `didChange` notifications—it never reads the buffer from
 disk. Closing a buffer returns the preview to the next most recent open
 document, and renders debounce briefly after the final edit. `gph` advertises
