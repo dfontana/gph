@@ -1,6 +1,10 @@
 #![forbid(unsafe_code)]
 
 mod kitty;
+// MML is intentionally not a CLI filetype yet; keep it compiled for its future
+// shorthand integration without exposing a separate library target.
+#[allow(dead_code)]
+mod mml;
 mod render;
 mod watch;
 

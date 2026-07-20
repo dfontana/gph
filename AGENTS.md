@@ -1,5 +1,7 @@
 # Agent Instructions
 
+This is a binary only crate, do not use lib.rs
+
 ## Definition of Done
 
 Before considering any Rust change complete:
