@@ -207,10 +207,18 @@ pub(crate) fn combine(
     primary: Result<(), String>,
     cleanup: Result<(), String>,
 ) -> Result<(), String> {
+    combine_with_context(primary, cleanup, "cleanup")
+}
+
+pub(crate) fn combine_with_context(
+    primary: Result<(), String>,
+    cleanup: Result<(), String>,
+    context: &str,
+) -> Result<(), String> {
     match (primary, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(format!("{primary}; cleanup failed: {cleanup}")),
+        (Err(primary), Err(cleanup)) => Err(format!("{primary}; {context} failed: {cleanup}")),
     }
 }
 

@@ -10,7 +10,7 @@ use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
+use tokio::task::JoinSet;
 use tower_lsp_server::jsonrpc::Result as LspResult;
 use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -30,10 +31,9 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{LanguageServer, LspService, Server};
 
 use crate::preview::{PreviewEvent, run_lsp_preview};
+use crate::preview_ui::combine_with_context;
 
 static CLIENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-
-type ClientStreams = Arc<Mutex<BTreeMap<u64, UnixStream>>>;
 
 /// Run the workspace daemon and its Kitty preview UI.
 pub fn run_daemon() -> Result<(), String> {
@@ -47,8 +47,7 @@ pub fn run_daemon() -> Result<(), String> {
     let socket = socket_path(&workspace)?;
     let _workspace_lock = WorkspaceLock::acquire(&socket)?;
     let mut artifacts = DaemonArtifacts::default();
-    let marker = prepare_workspace_marker(&socket, &workspace)?;
-    artifacts.marker = marker.created;
+    artifacts.marker = prepare_workspace_marker(&socket, &workspace)?;
     let bound = bind_listener(&socket)?;
     artifacts.socket = Some(bound.artifact);
     let listener = bound.listener;
@@ -60,12 +59,10 @@ pub fn run_daemon() -> Result<(), String> {
     })?;
     let (updates, receiver) = std::sync::mpsc::channel();
     let running = Arc::new(AtomicBool::new(true));
-    let client_streams = Arc::new(Mutex::new(BTreeMap::new()));
     let accept_running = Arc::clone(&running);
-    let accept_streams = Arc::clone(&client_streams);
     let accept_updates = updates.clone();
     let accept_thread = thread::spawn(move || {
-        let result = accept_loop(listener, updates, accept_running, accept_streams);
+        let result = accept_loop(listener, updates, accept_running);
         report_accept_result(&accept_updates, &result);
         result
     });
@@ -77,15 +74,10 @@ pub fn run_daemon() -> Result<(), String> {
     );
     let result = run_lsp_preview(receiver);
     running.store(false, Ordering::Relaxed);
-    close_client_streams(&client_streams);
     let accept_result = accept_thread
         .join()
         .map_err(|_| "gph LSP accept loop panicked".to_string())?;
-    match (result, accept_result) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(format!("{primary}; shutdown failed: {cleanup}")),
-    }
+    combine_with_context(result, accept_result, "shutdown")
 }
 
 /// Bridge stdin/stdout to the daemon for a normal LSP client such as Helix.
@@ -137,7 +129,6 @@ fn accept_loop(
     listener: UnixListener,
     updates: Sender<PreviewEvent>,
     running: Arc<AtomicBool>,
-    streams: ClientStreams,
 ) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -147,91 +138,47 @@ fn accept_loop(
     runtime.block_on(async move {
         let listener = TokioUnixListener::from_std(listener)
             .map_err(|error| format!("cannot configure LSP socket listener: {error}"))?;
-        let mut clients = Vec::new();
+        let mut clients = JoinSet::new();
 
         while running.load(Ordering::Relaxed) {
+            reap_finished_clients(&mut clients);
             match tokio::time::timeout(Duration::from_millis(10), listener.accept()).await {
-                Ok(Ok((stream, _))) => {
+                Ok(Ok((stream, _))) if running.load(Ordering::Relaxed) => {
                     let client = CLIENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-                    let stream = match stream.into_std() {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            eprintln!("gph lsp: cannot retain client connection: {error}");
-                            continue;
-                        }
-                    };
-                    let control = match stream.try_clone() {
-                        Ok(control) => control,
-                        Err(error) => {
-                            eprintln!("gph lsp: cannot retain client connection: {error}");
-                            continue;
-                        }
-                    };
-                    let retained = streams.lock().map_or_else(
-                        |_| {
-                            eprintln!("gph lsp: client stream registry is unavailable");
-                            false
-                        },
-                        |mut open_streams| {
-                            if running.load(Ordering::Relaxed) {
-                                open_streams.insert(client, control);
-                                true
-                            } else {
-                                false
-                            }
-                        },
-                    );
-                    if !retained {
-                        continue;
-                    }
-                    let stream = match TokioUnixStream::from_std(stream) {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            eprintln!("gph lsp: cannot configure client connection: {error}");
-                            remove_client_stream(&streams, client);
-                            continue;
-                        }
-                    };
                     let updates = updates.clone();
-                    let streams = Arc::clone(&streams);
-                    clients.push(tokio::spawn(async move {
-                        serve_client(stream, client, updates, streams).await;
-                    }));
+                    clients.spawn(async move {
+                        serve_client(stream, client, updates).await;
+                    });
                 }
+                Ok(Ok(_)) => break,
                 Ok(Err(error)) => eprintln!("gph lsp: accepting a client failed: {error}"),
                 Err(_) => {}
             }
         }
 
-        for client in clients {
-            if let Err(error) = client.await {
-                eprintln!("gph lsp: client task failed: {error}");
-            }
+        clients.abort_all();
+        while let Some(result) = clients.join_next().await {
+            report_client_task_result(result);
         }
         Ok(())
     })
 }
 
-fn close_client_streams(streams: &ClientStreams) {
-    if let Ok(mut open_streams) = streams.lock() {
-        for (_, stream) in std::mem::take(&mut *open_streams) {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+fn reap_finished_clients(clients: &mut JoinSet<()>) {
+    while let Some(result) = clients.try_join_next() {
+        report_client_task_result(result);
     }
 }
 
-fn remove_client_stream(streams: &ClientStreams, client: u64) {
-    if let Ok(mut open_streams) = streams.lock() {
-        open_streams.remove(&client);
+fn report_client_task_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        eprintln!("gph lsp: client task failed: {error}");
     }
 }
 
-async fn serve_client(
-    stream: TokioUnixStream,
-    client: u64,
-    updates: Sender<PreviewEvent>,
-    streams: ClientStreams,
-) {
+async fn serve_client(stream: TokioUnixStream, client: u64, updates: Sender<PreviewEvent>) {
     let (read, write) = stream.into_split();
     let backend_updates = updates.clone();
     let (service, socket) = LspService::new(move |_| Backend::new(client, backend_updates));
@@ -239,7 +186,6 @@ async fn serve_client(
         .concurrency_level(1)
         .serve(service)
         .await;
-    remove_client_stream(&streams, client);
     let _ = updates.send(PreviewEvent::Disconnect { client });
 }
 
@@ -475,52 +421,36 @@ fn workspace_marker_path(socket: &Path) -> PathBuf {
     socket.with_extension("workspace")
 }
 
-struct PreparedMarker {
-    created: Option<OwnedArtifact>,
-}
-
-fn prepare_workspace_marker(socket: &Path, workspace: &Path) -> Result<PreparedMarker, String> {
+fn prepare_workspace_marker(
+    socket: &Path,
+    workspace: &Path,
+) -> Result<Option<OwnedArtifact>, String> {
     let marker = workspace_marker_path(socket);
-    let expected = workspace.as_os_str().as_encoded_bytes();
     match fs::symlink_metadata(&marker) {
         Ok(metadata) => {
-            if !metadata.file_type().is_file() {
-                return Err(format!(
-                    "refusing non-file LSP workspace marker '{}'",
-                    marker.display()
-                ));
-            }
-            if metadata.permissions().mode() & 0o077 != 0 {
-                return Err(format!(
-                    "refusing insecure LSP workspace marker '{}'",
-                    marker.display()
-                ));
-            }
-            let actual = fs::read(&marker).map_err(|error| {
-                format!(
-                    "cannot read LSP workspace marker '{}': {error}",
-                    marker.display()
-                )
-            })?;
-            if actual != expected {
-                return Err(format!(
-                    "LSP socket hash collision at '{}'; use a different XDG_RUNTIME_DIR",
-                    socket.display()
-                ));
-            }
-            Ok(PreparedMarker { created: None })
+            validate_private_regular_file(&marker, "workspace marker", &metadata)?;
+            validate_workspace_marker_contents(&marker, socket, workspace)?;
+            Ok(None)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut file = OpenOptions::new()
+            let mut file = match OpenOptions::new()
                 .write(true)
                 .create_new(true)
+                .mode(0o600)
                 .open(&marker)
-                .map_err(|create_error| {
-                    format!(
-                        "cannot create LSP workspace marker '{}': {create_error}",
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    validate_workspace_marker(socket, workspace)?;
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create LSP workspace marker '{}': {error}",
                         marker.display()
-                    )
-                })?;
+                    ));
+                }
+            };
             let artifact = OwnedArtifact::from_metadata(
                 &marker,
                 file.metadata().map_err(|error| {
@@ -531,10 +461,9 @@ fn prepare_workspace_marker(socket: &Path, workspace: &Path) -> Result<PreparedM
                 })?,
                 ArtifactType::Regular,
             )?;
-            let result = file
-                .write_all(expected)
-                .and_then(|()| file.flush())
-                .and_then(|()| fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)));
+            let result = fs::set_permissions(&marker, fs::Permissions::from_mode(0o600))
+                .and_then(|()| file.write_all(workspace.as_os_str().as_encoded_bytes()))
+                .and_then(|()| file.flush());
             if let Err(error) = result {
                 artifact.remove();
                 return Err(format!(
@@ -542,9 +471,7 @@ fn prepare_workspace_marker(socket: &Path, workspace: &Path) -> Result<PreparedM
                     marker.display()
                 ));
             }
-            Ok(PreparedMarker {
-                created: Some(artifact),
-            })
+            Ok(Some(artifact))
         }
         Err(error) => Err(format!(
             "cannot inspect LSP workspace marker '{}': {error}",
@@ -561,13 +488,16 @@ fn validate_workspace_marker(socket: &Path, workspace: &Path) -> Result<(), Stri
             socket.display()
         )
     })?;
-    if !metadata.file_type().is_file() {
-        return Err(format!(
-            "refusing non-file LSP workspace marker '{}'",
-            marker.display()
-        ));
-    }
-    let actual = fs::read(&marker).map_err(|error| {
+    validate_private_regular_file(&marker, "workspace marker", &metadata)?;
+    validate_workspace_marker_contents(&marker, socket, workspace)
+}
+
+fn validate_workspace_marker_contents(
+    marker: &Path,
+    socket: &Path,
+    workspace: &Path,
+) -> Result<(), String> {
+    let actual = fs::read(marker).map_err(|error| {
         format!(
             "cannot read LSP workspace marker '{}': {error}",
             marker.display()
@@ -583,10 +513,39 @@ fn validate_workspace_marker(socket: &Path, workspace: &Path) -> Result<(), Stri
     }
 }
 
+fn validate_private_regular_file(
+    path: &Path,
+    description: &str,
+    metadata: &fs::Metadata,
+) -> Result<(), String> {
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing non-file LSP {description} '{}'",
+            path.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "refusing insecure LSP {description} '{}'",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum ArtifactType {
     Regular,
     Socket,
+}
+
+impl ArtifactType {
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        match self {
+            Self::Regular => metadata.file_type().is_file(),
+            Self::Socket => metadata.file_type().is_socket(),
+        }
+    }
 }
 
 struct OwnedArtifact {
@@ -609,11 +568,7 @@ impl OwnedArtifact {
         metadata: fs::Metadata,
         kind: ArtifactType,
     ) -> Result<Self, String> {
-        let matches_kind = match kind {
-            ArtifactType::Regular => metadata.file_type().is_file(),
-            ArtifactType::Socket => metadata.file_type().is_socket(),
-        };
-        if !matches_kind {
+        if !kind.matches(&metadata) {
             return Err(format!(
                 "unexpected LSP artifact type at '{}'",
                 path.display()
@@ -631,11 +586,10 @@ impl OwnedArtifact {
         let Ok(metadata) = fs::symlink_metadata(&self.path) else {
             return;
         };
-        let matches_kind = match self.kind {
-            ArtifactType::Regular => metadata.file_type().is_file(),
-            ArtifactType::Socket => metadata.file_type().is_socket(),
-        };
-        if matches_kind && metadata.dev() == self.device && metadata.ino() == self.inode {
+        if self.kind.matches(&metadata)
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+        {
             let _ = fs::remove_file(&self.path);
         }
     }
@@ -665,51 +619,50 @@ struct WorkspaceLock {
 impl WorkspaceLock {
     fn acquire(socket: &Path) -> Result<Self, String> {
         let path = socket.with_extension("lock");
-        let file = match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_file() {
-                    return Err(format!("refusing non-file LSP lock '{}'", path.display()));
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            Ok(file) => {
+                let artifact = OwnedArtifact::from_metadata(
+                    &path,
+                    file.metadata().map_err(|error| {
+                        format!("cannot inspect LSP lock '{}': {error}", path.display())
+                    })?,
+                    ArtifactType::Regular,
+                )?;
+                if let Err(error) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+                    artifact.remove();
+                    return Err(format!(
+                        "cannot secure LSP lock '{}': {error}",
+                        path.display()
+                    ));
                 }
-                if metadata.permissions().mode() & 0o077 != 0 {
-                    return Err(format!("refusing insecure LSP lock '{}'", path.display()));
-                }
-                OpenOptions::new().read(true).write(true).open(&path)
+                file
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                match OpenOptions::new()
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let metadata = fs::symlink_metadata(&path).map_err(|error| {
+                    format!("cannot inspect LSP lock '{}': {error}", path.display())
+                })?;
+                validate_private_regular_file(&path, "lock", &metadata)?;
+                OpenOptions::new()
                     .read(true)
                     .write(true)
-                    .create_new(true)
                     .open(&path)
-                {
-                    Ok(file) => {
-                        let artifact = OwnedArtifact::from_metadata(
-                            &path,
-                            file.metadata().map_err(|error| {
-                                format!("cannot inspect LSP lock '{}': {error}", path.display())
-                            })?,
-                            ArtifactType::Regular,
-                        )?;
-                        if let Err(error) =
-                            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                        {
-                            artifact.remove();
-                            return Err(format!(
-                                "cannot secure LSP lock '{}': {error}",
-                                path.display()
-                            ));
-                        }
-                        Ok(file)
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        OpenOptions::new().read(true).write(true).open(&path)
-                    }
-                    Err(error) => Err(error),
-                }
+                    .map_err(|error| {
+                        format!("cannot open LSP lock '{}': {error}", path.display())
+                    })?
             }
-            Err(error) => Err(error),
-        }
-        .map_err(|error| format!("cannot open LSP lock '{}': {error}", path.display()))?;
+            Err(error) => {
+                return Err(format!(
+                    "cannot open LSP lock '{}': {error}",
+                    path.display()
+                ));
+            }
+        };
         match file.try_lock_exclusive() {
             Ok(()) => Ok(Self { file }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(format!(
@@ -849,33 +802,24 @@ mod tests {
     }
 
     #[test]
-    fn tower_service_routes_a_client_session_and_disconnects_the_preview() {
+    fn tower_service_routes_a_client_session_and_reports_natural_disconnects() {
         let (server, client) = UnixStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
         let (updates, receiver) = std::sync::mpsc::channel();
-        let streams = Arc::new(Mutex::new(BTreeMap::new()));
-        let server_stream = server.try_clone().unwrap();
-        streams.lock().unwrap().insert(9, server_stream);
-        let streams_for_server = Arc::clone(&streams);
         let server = thread::spawn(move || {
             runtime().block_on(async move {
                 let server = TokioUnixStream::from_std(server).unwrap();
-                serve_client(server, 9, updates, streams_for_server).await;
+                serve_client(server, 9, updates).await;
             });
         });
 
         let initialize =
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
         let open = r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///diagram.mmd","languageId":"mermaid","version":1,"text":"one"}}}"#;
-        let shutdown = r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#;
-        let exit = r#"{"jsonrpc":"2.0","method":"exit"}"#;
         let mut client = BufReader::new(client);
         send_message(client.get_mut(), initialize);
         let initialize_reply = read_message(&mut client);
         send_message(client.get_mut(), open);
-        send_message(client.get_mut(), shutdown);
-        let shutdown_reply = read_message(&mut client);
-        send_message(client.get_mut(), exit);
         client
             .get_mut()
             .shutdown(std::net::Shutdown::Write)
@@ -885,7 +829,6 @@ mod tests {
             initialize_reply.contains("\"textDocumentSync\":{\"openClose\":true,\"change\":1}"),
             "unexpected initialize reply: {initialize_reply}"
         );
-        assert!(shutdown_reply.contains("\"id\":2"));
         assert!(matches!(
             receiver.recv().unwrap(),
             PreviewEvent::Set { client: 9, ref text, version: 1, .. } if text == "one"
@@ -894,7 +837,40 @@ mod tests {
             receiver.recv().unwrap(),
             PreviewEvent::Disconnect { client: 9 }
         ));
-        assert!(streams.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn daemon_shutdown_cancels_an_idle_connected_client_promptly() {
+        let path = temporary_path("idle-client");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        let accept_running = Arc::clone(&running);
+        let (updates, _receiver) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let accept_thread = thread::spawn(move || {
+            done.send(accept_loop(listener, updates, accept_running))
+                .unwrap();
+        });
+
+        let client = UnixStream::connect(&path).unwrap();
+        let mut client = BufReader::new(client);
+        let initialize =
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+        send_message(client.get_mut(), initialize);
+        let _ = read_message(&mut client);
+
+        running.store(false, Ordering::Relaxed);
+        assert!(
+            finished
+                .recv_timeout(Duration::from_secs(1))
+                .expect("accept loop did not stop promptly")
+                .is_ok()
+        );
+        let mut eof = [0];
+        assert_eq!(client.read(&mut eof).unwrap(), 0);
+        accept_thread.join().unwrap();
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -946,9 +922,14 @@ mod tests {
             fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            validate_workspace_marker(&socket, workspace),
+            Err(error) if error.contains("insecure LSP workspace marker")
+        ));
         drop(DaemonArtifacts {
             socket: None,
-            marker: prepared.created,
+            marker: prepared,
         });
         assert!(!marker.exists());
     }
@@ -963,7 +944,17 @@ mod tests {
         ));
         drop(first);
         drop(WorkspaceLock::acquire(&socket).unwrap());
-        fs::remove_file(socket.with_extension("lock")).unwrap();
+        let path = socket.with_extension("lock");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            WorkspaceLock::acquire(&socket),
+            Err(error) if error.contains("insecure LSP lock")
+        ));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
