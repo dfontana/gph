@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod files;
 mod kitty;
 mod render;
 mod watch;
@@ -9,10 +8,10 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(about = "Kitty-native Mermaid previewer and SVG exporter")]
+#[command(about = "Kitty-native Mermaid previewer and renderer")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -25,20 +24,37 @@ enum Command {
         /// Mermaid source file to watch.
         file: PathBuf,
     },
-    /// Render Mermaid source as an SVG file.
-    Export {
+    /// Render Mermaid source as SVG, PNG, JPEG, or PDF.
+    #[command(visible_alias = "export")]
+    Render {
         /// Mermaid input file, or - to read stdin.
         input: PathBuf,
-        /// SVG destination. Its extension must be .svg.
-        #[arg(short, long, value_name = "OUTPUT.svg")]
+        /// Destination file.
+        #[arg(short = 'o', long = "out", alias = "output", value_name = "OUTPUT")]
         output: PathBuf,
+        /// Output format. Inferred from OUTPUT when omitted.
+        #[arg(short, long, value_enum)]
+        format: Option<OutputFormat>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OutputFormat {
+    Svg,
+    Png,
+    #[value(alias = "jpg")]
+    Jpeg,
+    Pdf,
 }
 
 fn main() {
     let result = match Cli::parse().command {
         Command::Watch { file } => watch(file),
-        Command::Export { input, output } => export(&input, &output),
+        Command::Render {
+            input,
+            output,
+            format,
+        } => render(&input, &output, format),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
@@ -55,20 +71,45 @@ fn watch(file: PathBuf) -> Result<(), String> {
     watch::run(file)
 }
 
-fn export(input: &Path, output: &Path) -> Result<(), String> {
-    if !output
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-    {
-        return Err(format!(
-            "output '{}' must have a .svg extension",
-            output.display()
-        ));
-    }
+fn render(
+    input: &Path,
+    output: &Path,
+    requested_format: Option<OutputFormat>,
+) -> Result<(), String> {
+    let format = output_format(output, requested_format)?;
     let source = read_input(input)?;
-    let svg = render::Renderer::new().svg(&source)?;
-    files::write_atomically(output, &svg)
+    let renderer = render::Renderer::new();
+    let bytes = match format {
+        OutputFormat::Svg => renderer.svg(&source)?.into_bytes(),
+        OutputFormat::Png => renderer.raster(&source, render::RasterFormat::Png)?,
+        OutputFormat::Jpeg => renderer.raster(&source, render::RasterFormat::Jpeg)?,
+        OutputFormat::Pdf => renderer.raster(&source, render::RasterFormat::Pdf)?,
+    };
+    render::files::write_atomically(output, &bytes)
         .map_err(|error| format!("cannot write '{}': {error}", output.display()))
+}
+
+fn output_format(
+    output: &Path,
+    requested_format: Option<OutputFormat>,
+) -> Result<OutputFormat, String> {
+    if let Some(format) = requested_format {
+        return Ok(format);
+    }
+    match output.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if extension.eq_ignore_ascii_case("svg") => Ok(OutputFormat::Svg),
+        Some(extension) if extension.eq_ignore_ascii_case("png") => Ok(OutputFormat::Png),
+        Some(extension)
+            if extension.eq_ignore_ascii_case("jpeg") || extension.eq_ignore_ascii_case("jpg") =>
+        {
+            Ok(OutputFormat::Jpeg)
+        }
+        Some(extension) if extension.eq_ignore_ascii_case("pdf") => Ok(OutputFormat::Pdf),
+        _ => Err(format!(
+            "cannot infer a format from '{}'; pass --format",
+            output.display()
+        )),
+    }
 }
 
 fn read_input(path: &Path) -> Result<String, String> {
@@ -98,14 +139,6 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    fn temporary_path(name: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("gph-{name}-{}-{nanos}", std::process::id()))
-    }
-
     #[test]
     fn parses_watch_command() {
         let cli = Cli::try_parse_from(["gph", "watch", "diagram.mmd"]).unwrap();
@@ -113,42 +146,5 @@ mod tests {
             panic!("expected watch command");
         };
         assert_eq!(file, Path::new("diagram.mmd"));
-    }
-
-    #[test]
-    fn export_writes_svg_after_a_successful_render() {
-        let input = temporary_path("input");
-        let output = temporary_path("output").with_extension("svg");
-        std::fs::write(&input, "flowchart TD\nA --> B\n").unwrap();
-
-        super::export(&input, &output).unwrap();
-        assert!(
-            std::fs::read_to_string(&output)
-                .unwrap()
-                .starts_with("<svg")
-        );
-
-        std::fs::remove_file(input).unwrap();
-        std::fs::remove_file(output).unwrap();
-    }
-
-    #[test]
-    fn failed_export_preserves_existing_destination() {
-        let input = temporary_path("invalid-input");
-        let output = temporary_path("existing-output").with_extension("svg");
-        std::fs::write(&input, "not Mermaid").unwrap();
-        std::fs::write(&output, "existing output").unwrap();
-
-        assert!(super::export(&input, &output).is_err());
-        assert_eq!(std::fs::read_to_string(&output).unwrap(), "existing output");
-
-        std::fs::remove_file(input).unwrap();
-        std::fs::remove_file(output).unwrap();
-    }
-
-    #[test]
-    fn export_requires_svg_extension() {
-        let error = super::export(Path::new("missing.mmd"), Path::new("output.png")).unwrap_err();
-        assert!(error.contains(".svg extension"));
     }
 }

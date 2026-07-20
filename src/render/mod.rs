@@ -1,3 +1,5 @@
+pub mod files;
+
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
 use std::sync::{
@@ -11,6 +13,12 @@ use merman::render::{
 };
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
+
+pub enum RasterFormat {
+    Png,
+    Jpeg,
+    Pdf,
+}
 static SVG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SVG_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
 
@@ -46,8 +54,25 @@ impl Renderer {
     pub fn png(&self, source: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
         let options = RasterOptions::default()
             .with_fit_to(RasterFitBox::contain(width.max(1), height.max(1)));
-        self.inner
-            .render_png_sync(strip_bom(source), &options)
+        self.raster_with_options(source, RasterFormat::Png, &options)
+    }
+
+    pub fn raster(&self, source: &str, format: RasterFormat) -> Result<Vec<u8>, String> {
+        self.raster_with_options(source, format, &RasterOptions::default())
+    }
+
+    fn raster_with_options(
+        &self,
+        source: &str,
+        format: RasterFormat,
+        options: &RasterOptions,
+    ) -> Result<Vec<u8>, String> {
+        let rendered = match format {
+            RasterFormat::Png => self.inner.render_png_sync(strip_bom(source), options),
+            RasterFormat::Jpeg => self.inner.render_jpeg_sync(strip_bom(source), options),
+            RasterFormat::Pdf => self.inner.render_pdf_sync(strip_bom(source)),
+        };
+        rendered
             .map_err(|error| format!("render failed: {error}"))?
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }

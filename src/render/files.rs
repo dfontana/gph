@@ -7,7 +7,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Replace `path` only after all new contents have been written to a private,
 /// same-directory temporary file. Existing permissions are retained.
-pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
+pub fn write_atomically(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     let destination = resolved_destination(path)?;
     let directory = destination
         .parent()
@@ -37,7 +37,7 @@ pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
         };
 
         let result = (|| {
-            file.write_all(contents.as_bytes())?;
+            file.write_all(contents.as_ref())?;
             file.flush()?;
             drop(file);
             if let Some(permissions) = permissions {
