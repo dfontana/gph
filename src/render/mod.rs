@@ -8,11 +8,15 @@ use std::sync::{
 };
 
 use merman::render::{
-    HeadlessRenderer,
+    HeadlessRenderer, RootBackgroundPostprocessor, SvgPipeline,
     raster::{RasterFitBox, RasterOptions},
 };
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
+/// Every output path renders the diagram over a transparent page background so previews and
+/// exports composite cleanly onto the terminal, an editor pane, or another document. JPEG has
+/// no alpha channel, so its raster fill still flattens this onto opaque white.
+const TRANSPARENT_BACKGROUND: &str = "transparent";
 
 pub enum RasterFormat {
     Png,
@@ -38,7 +42,10 @@ impl Renderer {
         Self {
             inner: HeadlessRenderer::new()
                 .with_strict_parsing()
-                .with_diagram_id(PREVIEW_DIAGRAM_ID),
+                .with_diagram_id(PREVIEW_DIAGRAM_ID)
+                // Drives the raster paths (PNG/JPEG/PDF), which render this pipeline before
+                // encoding. The SVG path uses its own pipeline in `svg()` below.
+                .with_svg_pipeline(transparent_background(SvgPipeline::resvg_safe())),
         }
     }
 
@@ -46,7 +53,12 @@ impl Renderer {
         self.inner
             .clone()
             .with_diagram_id(&next_svg_diagram_id())
-            .render_svg_sync(strip_bom(source))
+            // A parity preset leaves the SVG untouched apart from the transparent background,
+            // rather than applying the raster-oriented `resvg_safe` cleanups to an SVG export.
+            .render_svg_with_pipeline_sync(
+                strip_bom(source),
+                &transparent_background(SvgPipeline::parity()),
+            )
             .map_err(|error| format!("render failed: {error}"))?
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
@@ -82,6 +94,12 @@ impl Renderer {
             .map_err(|error| format!("render failed: {error}"))?
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
+}
+
+/// Appends the transparent-background rewrite to `pipeline`, overriding the theme's default page
+/// fill (typically opaque white) on the SVG root.
+fn transparent_background(pipeline: SvgPipeline) -> SvgPipeline {
+    pipeline.with_postprocessor(RootBackgroundPostprocessor::new(TRANSPARENT_BACKGROUND))
 }
 
 fn next_svg_diagram_id() -> String {
@@ -173,6 +191,27 @@ mod tests {
     fn renders_png_for_preview() {
         let png = Renderer::new().png(FLOWCHART, 640, 480, 1.0).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn svg_background_is_transparent() {
+        let svg = Renderer::new().svg(FLOWCHART).unwrap();
+        assert!(svg.contains("background-color: transparent"), "{svg}");
+        assert!(!svg.contains("background-color: white"), "{svg}");
+    }
+
+    #[test]
+    fn png_background_is_transparent() {
+        let png = Renderer::new().png(FLOWCHART, 640, 480, 1.0).unwrap();
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        // The top-left corner sits in the page margin, so a transparent background leaves its
+        // alpha at 0 rather than the theme's opaque white.
+        let top_left_alpha = buf[3];
+        assert_eq!(top_left_alpha, 0, "expected a transparent corner");
     }
 
     #[test]

@@ -22,3 +22,6 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 tower-lsp-server = { version = "0.23", default-features = false, features = ["runtime-tokio"] }
 winnow = "1.0.4"
+
+[dev-dependencies]
+png = "0.18"

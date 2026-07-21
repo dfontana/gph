@@ -1033,6 +1033,7 @@ dependencies = [
  "fs2",
  "merman",
  "notify",
+ "png",
  "ratatui",
  "tokio",
  "tower-lsp-server",
