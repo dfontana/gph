@@ -92,7 +92,14 @@ pub fn place_png(pane: Rect, png: &[u8], pan: (i32, i32)) -> Placement {
     }
     let cell_width = u32::from(terminal.width) / u32::from(terminal.columns);
     let cell_height = u32::from(terminal.height) / u32::from(terminal.rows);
-    place(pane, image_width, image_height, cell_width, cell_height, pan)
+    place(
+        pane,
+        image_width,
+        image_height,
+        cell_width,
+        cell_height,
+        pan,
+    )
 }
 
 fn place(
@@ -311,7 +318,11 @@ mod tests {
 
     #[test]
     fn panning_slides_the_crop_window_and_clamps_it_to_the_image_edges() {
-        let at = |pan| place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16, pan).crop.unwrap();
+        let at = |pan| {
+            place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16, pan)
+                .crop
+                .unwrap()
+        };
         // Ten cells right and three down move the window by 80px and 48px from center.
         assert_eq!((at((10, 3)).x, at((10, 3)).y), (760, 288));
         assert_eq!((at((-10, -3)).x, at((-10, -3)).y), (600, 192));

@@ -575,7 +575,11 @@ mod tests {
         let mut first = Vec::new();
         image.show(b"png".to_vec());
         image.display(pane, &mut first).unwrap();
-        assert!(String::from_utf8(first).unwrap().contains("a=t,f=100,t=d,i="));
+        assert!(
+            String::from_utf8(first)
+                .unwrap()
+                .contains("a=t,f=100,t=d,i=")
+        );
 
         // A second display of the same pixels (as panning does) only re-places them.
         let mut second = Vec::new();

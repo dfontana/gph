@@ -8,17 +8,56 @@ use std::sync::{
 };
 
 use merman::render::{
-    HeadlessRenderer, RootBackgroundPostprocessor, SvgPipeline,
+    HeadlessRenderer, HostThemeAppearance, HostThemeOutput, HostThemeProfile, HostThemeRoles,
+    HostThemeRootBackground,
     raster::{RasterOptions, svg_raster_plan, svg_to_png},
 };
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
 /// Clear space between a fitted preview diagram and the edge of its viewport.
 const PREVIEW_EDGE_PADDING: u32 = 15;
-/// Every output path renders the diagram over a transparent page background so previews and
-/// exports composite cleanly onto the terminal, an editor pane, or another document. JPEG has
-/// no alpha channel, so its raster fill still flattens this onto opaque white.
-const TRANSPARENT_BACKGROUND: &str = "transparent";
+
+/// Rosé Pine Dawn palette roles used across every renderer-owned output path.
+///
+/// This is a merman host theme profile rather than custom CSS: merman expands its semantic roles
+/// into the per-diagram Mermaid configuration and carries its raster-safe output pipeline with the
+/// renderer.
+fn rose_pine_dawn_theme() -> HostThemeProfile {
+    let mut output = HostThemeOutput::resvg_safe_editor();
+    output.root_background = HostThemeRootBackground::Color("transparent".to_string());
+
+    HostThemeProfile::builder()
+        .appearance(HostThemeAppearance::Light)
+        .roles(HostThemeRoles {
+            canvas: Some("#faf4ed".to_string()),
+            surface: Some("#fffaf3".to_string()),
+            surface_alt: Some("#f2e9e1".to_string()),
+            surface_muted: Some("#f4ede8".to_string()),
+            text: Some("#575279".to_string()),
+            subtle_text: Some("#797593".to_string()),
+            border: Some("#cecacd".to_string()),
+            line: Some("#286983".to_string()),
+            edge_label_background: Some("#faf4ed".to_string()),
+            cluster_background: Some("#f2e9e1".to_string()),
+            cluster_border: Some("#dfdad9".to_string()),
+            note_background: Some("#f4ede8".to_string()),
+            note_border: Some("#ea9d34".to_string()),
+            note_text: Some("#575279".to_string()),
+            actor_background: Some("#f2e9e1".to_string()),
+            actor_border: Some("#cecacd".to_string()),
+            actor_text: Some("#575279".to_string()),
+            activation_background: Some("#f4ede8".to_string()),
+            activation_border: Some("#cecacd".to_string()),
+            error: Some("#b4637a".to_string()),
+            warning: Some("#ea9d34".to_string()),
+            success: Some("#56949f".to_string()),
+        })
+        .series_palette([
+            "#286983", "#56949f", "#ea9d34", "#907aa9", "#d7827e", "#b4637a",
+        ])
+        .output(output)
+        .build()
+}
 
 pub enum RasterFormat {
     Png,
@@ -44,10 +83,8 @@ impl Renderer {
         Self {
             inner: HeadlessRenderer::new()
                 .with_strict_parsing()
-                .with_diagram_id(PREVIEW_DIAGRAM_ID)
-                // Drives the raster paths (PNG/JPEG/PDF), which render this pipeline before
-                // encoding. The SVG path uses its own pipeline in `svg()` below.
-                .with_svg_pipeline(transparent_background(SvgPipeline::resvg_safe())),
+                .with_host_theme(&rose_pine_dawn_theme())
+                .with_diagram_id(PREVIEW_DIAGRAM_ID),
         }
     }
 
@@ -55,12 +92,7 @@ impl Renderer {
         self.inner
             .clone()
             .with_diagram_id(&next_svg_diagram_id())
-            // A parity preset leaves the SVG untouched apart from the transparent background,
-            // rather than applying the raster-oriented `resvg_safe` cleanups to an SVG export.
-            .render_svg_with_pipeline_sync(
-                strip_bom(source),
-                &transparent_background(SvgPipeline::parity()),
-            )
+            .render_svg_sync(strip_bom(source))
             .map_err(|error| format!("render failed: {error}"))?
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
@@ -134,12 +166,6 @@ fn preview_fit_box(width: u32, height: u32) -> (u32, u32) {
         width.saturating_sub(inset).max(1),
         height.saturating_sub(inset).max(1),
     )
-}
-
-/// Appends the transparent-background rewrite to `pipeline`, overriding the theme's default page
-/// fill (typically opaque white) on the SVG root.
-fn transparent_background(pipeline: SvgPipeline) -> SvgPipeline {
-    pipeline.with_postprocessor(RootBackgroundPostprocessor::new(TRANSPARENT_BACKGROUND))
 }
 
 fn next_svg_diagram_id() -> String {
@@ -254,24 +280,27 @@ mod tests {
     }
 
     #[test]
-    fn svg_background_is_transparent() {
+    fn svg_uses_rose_pine_dawn_roles_with_a_transparent_background() {
         let svg = Renderer::new().svg(FLOWCHART).unwrap();
         assert!(svg.contains("background-color: transparent"), "{svg}");
-        assert!(!svg.contains("background-color: white"), "{svg}");
+        assert!(svg.contains("#575279"), "{svg}");
+        assert!(svg.contains("#286983"), "{svg}");
     }
 
     #[test]
-    fn png_background_is_transparent() {
-        let png = Renderer::new().png(FLOWCHART, 640, 480, 1.0).unwrap();
-        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
-        let mut reader = decoder.read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
-        let info = reader.next_frame(&mut buf).unwrap();
-        assert_eq!(info.color_type, png::ColorType::Rgba);
-        // The top-left corner sits in the page margin, so a transparent background leaves its
-        // alpha at 0 rather than the theme's opaque white.
-        let top_left_alpha = buf[3];
-        assert_eq!(top_left_alpha, 0, "expected a transparent corner");
+    fn preview_and_export_png_keep_a_transparent_background() {
+        let renderer = Renderer::new();
+        let preview = renderer.png(FLOWCHART, 640, 480, 1.0).unwrap();
+        let exported = renderer.raster(FLOWCHART, RasterFormat::Png).unwrap();
+
+        for png in [&preview, &exported] {
+            let decoder = png::Decoder::new(std::io::Cursor::new(png));
+            let mut reader = decoder.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            assert_eq!(info.color_type, png::ColorType::Rgba);
+            assert_eq!(buf[3], 0, "expected a transparent corner");
+        }
     }
 
     #[test]

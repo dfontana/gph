@@ -3,7 +3,9 @@
 `gph` is a small, Kitty-native Mermaid previewer. It uses
 [merman](https://github.com/Latias94/merman) for parsing, layout, SVG, and PNG
 rendering, watches source files for changes, shows a live Kitty image preview, and
-renders SVG, PNG, JPEG, and PDF files.
+renders SVG, PNG, JPEG, and PDF files. Every output uses a Rosé Pine Dawn
+[merman host theme profile](https://github.com/Latias94/merman/blob/main/crates/merman/examples/example_12_host_theme_profile.rs),
+not custom CSS; their page backgrounds remain transparent for preview and exported images.
 
 There is no custom diagram language in the CLI, manual node positioning, mouse
 interaction, or browser/Node runtime. Mermaid decides all layout. The binary
