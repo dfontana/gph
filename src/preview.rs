@@ -183,26 +183,28 @@ impl LspPreviewState {
         self.image.clear();
     }
 
-    fn status(&self) -> String {
+    /// Left-aligned header title: the pane name and open-document count.
+    fn header_left(&self) -> String {
+        format!(" LSP Preview  {} open document(s) ", self.documents.len())
+    }
+
+    /// Right-aligned header title: the current zoom level and control hints.
+    fn header_right(&self) -> String {
+        let zoom = self.image.zoom();
+        format!(
+            " {}% · +/- zoom · drag to pan ",
+            (zoom * 100.0).round() as u32
+        )
+    }
+
+    /// The footer line: the selected document's URI, or a waiting/error notice.
+    fn footer(&self) -> String {
         if let Some(error) = &self.render_error {
             return error.clone();
         }
-        let zoom = self.zoom_label();
         match self.selected() {
-            Some((uri, _)) => {
-                format!(" {} open document(s) · {uri}{zoom}", self.documents.len())
-            }
-            None => format!(" Waiting for a Mermaid document from an LSP client{zoom} "),
-        }
-    }
-
-    /// A trailing zoom hint for the status line, blank at an exact fit.
-    fn zoom_label(&self) -> String {
-        let zoom = self.image.zoom();
-        if (zoom - 1.0).abs() < 1e-3 {
-            String::new()
-        } else {
-            format!(" · {}% (+/- zoom · drag to pan)", (zoom * 100.0).round() as u32)
+            Some((uri, _)) => format!(" {uri} "),
+            None => " Waiting for a Mermaid document from an LSP client ".to_string(),
         }
     }
 }
@@ -332,7 +334,8 @@ fn draw_lsp_preview(frame: &mut ratatui::Frame, state: &LspPreviewState) {
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(" LSP Preview "),
+            .title_top(Line::from(state.header_left()))
+            .title_top(Line::from(state.header_right()).right_aligned()),
         panes.preview_border,
     );
     let style = if state.render_error.is_some() {
@@ -341,7 +344,7 @@ fn draw_lsp_preview(frame: &mut ratatui::Frame, state: &LspPreviewState) {
         Style::default().fg(Color::DarkGray)
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(state.status(), style))),
+        Paragraph::new(Line::from(Span::styled(state.footer(), style))),
         panes.status,
     );
 }
