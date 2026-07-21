@@ -108,9 +108,29 @@ where
         }
     });
 
-    io::copy(&mut stream, &mut output)
-        .and_then(|_| output.flush())
+    copy_flushing(&mut stream, &mut output)
         .map_err(|error| format!("cannot forward LSP replies: {error}"))
+}
+
+/// Like [`io::copy`], but flushes `output` after every chunk instead of only at EOF.
+///
+/// `output` is typically [`io::stdout()`], which Rust always line-buffers regardless of
+/// whether the destination is a terminal, pipe, or file. LSP frame bodies are single-line
+/// JSON with no trailing newline, so without an explicit flush per chunk they sit buffered
+/// until the connection closes — starving any client that keeps the connection open.
+fn copy_flushing<R: Read + ?Sized, W: Write + ?Sized>(
+    input: &mut R,
+    output: &mut W,
+) -> io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..read])?;
+        output.flush()?;
+    }
 }
 
 fn report_accept_result(updates: &Sender<PreviewEvent>, result: &Result<(), String>) {
