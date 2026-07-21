@@ -36,7 +36,7 @@ before rerendering. The preview starts below the command's existing terminal
 output and grows downward when its pane is resized; it never enters the alternate
 screen. Invalid Mermaid leaves the
 last valid preview visible and reports the error in the preview border. Press
-`+` to zoom in, `-` to zoom out, and `0` to return to a pane fit; the current
+`+` to zoom in, `-` to zoom out, and `0` to return to a comfortably padded pane fit; the current
 magnification shows in the status line. While zoomed in, click and drag with the
 mouse to pan around the diagram. Press `Ctrl-C` or `Ctrl-Q` to quit.
 
@@ -73,7 +73,7 @@ disk. Closing a buffer returns the preview to the next most recent open
 document, and renders debounce briefly after the final edit. `gph` advertises
 LSP full text synchronization (`openClose` and `change = 1`) only, so
 `merman-lsp` remains the diagnostics provider. `+`/`-` zoom the preview and `0`
-returns it to a pane fit, and click-and-drag pans a zoomed diagram, matching
+returns it to a comfortably padded pane fit, and click-and-drag pans a zoomed diagram, matching
 `gph watch`. Quit the Kitty preview pane with
 `Ctrl-Q` or `Ctrl-C`; the socket is removed and a later Helix connection reports
 that `gph lsp` needs to be started again.

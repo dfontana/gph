@@ -9,10 +9,12 @@ use std::sync::{
 
 use merman::render::{
     HeadlessRenderer, RootBackgroundPostprocessor, SvgPipeline,
-    raster::{RasterFitBox, RasterOptions},
+    raster::{RasterOptions, svg_raster_plan, svg_to_png},
 };
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
+/// Clear space between a fitted preview diagram and the edge of its viewport.
+const PREVIEW_EDGE_PADDING: u32 = 15;
 /// Every output path renders the diagram over a transparent page background so previews and
 /// exports composite cleanly onto the terminal, an editor pane, or another document. JPEG has
 /// no alpha channel, so its raster fill still flattens this onto opaque white.
@@ -63,16 +65,27 @@ impl Renderer {
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
 
-    /// Rasterize `source` to fit `width` x `height`, magnified by `zoom`.
+    /// Rasterize `source` to fill a comfortably inset `width` x `height` preview, magnified by
+    /// `zoom`.
     ///
-    /// The fit box only ever shrinks an oversized diagram to the pane; `zoom` is applied
-    /// as the raster scale, which is what actually enlarges the preview past its fitted
-    /// (or natural) size so callers can zoom in on detail.
+    /// The initial scale fits either small or oversized diagrams into the padded viewport.
+    /// Further magnification deliberately lets the diagram overflow so it can be panned.
     pub fn png(&self, source: &str, width: u32, height: u32, zoom: f32) -> Result<Vec<u8>, String> {
-        let options = RasterOptions::default()
-            .with_fit_to(RasterFitBox::contain(width.max(1), height.max(1)))
-            .with_scale(zoom.max(1.0));
-        self.raster_with_options(source, RasterFormat::Png, &options)
+        let svg = self
+            .inner
+            .render_svg_sync(strip_bom(source))
+            .map_err(|error| format!("render failed: {error}"))?
+            .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())?;
+        let plan = svg_raster_plan(&svg, &RasterOptions::default().with_unbounded_size())
+            .map_err(|error| format!("render failed: {error}"))?;
+        let options = RasterOptions::default().with_scale(preview_scale(
+            plan.requested_width_px,
+            plan.requested_height_px,
+            width,
+            height,
+            zoom,
+        ));
+        svg_to_png(&svg, &options).map_err(|error| format!("render failed: {error}"))
     }
 
     pub fn raster(&self, source: &str, format: RasterFormat) -> Result<Vec<u8>, String> {
@@ -94,6 +107,33 @@ impl Renderer {
             .map_err(|error| format!("render failed: {error}"))?
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
+}
+
+/// The scale that fills a padded preview viewport while preserving the diagram's aspect ratio.
+fn preview_scale(
+    diagram_width: u32,
+    diagram_height: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+    zoom: f32,
+) -> f32 {
+    let (fit_width, fit_height) = preview_fit_box(viewport_width, viewport_height);
+    let fit = (fit_width as f32 / diagram_width.max(1) as f32)
+        .min(fit_height as f32 / diagram_height.max(1) as f32);
+    // Rounding a scale up can turn an exact fit into a one-pixel overflow.
+    fit.next_down() * zoom.max(1.0)
+}
+
+/// The padded rectangle that a default preview is allowed to occupy.
+///
+/// A tiny terminal may not have room for the full margin, but raster dimensions must always stay
+/// positive for the renderer.
+fn preview_fit_box(width: u32, height: u32) -> (u32, u32) {
+    let inset = PREVIEW_EDGE_PADDING * 2;
+    (
+        width.saturating_sub(inset).max(1),
+        height.saturating_sub(inset).max(1),
+    )
 }
 
 /// Appends the transparent-background rewrite to `pipeline`, overriding the theme's default page
@@ -188,9 +228,29 @@ mod tests {
     }
 
     #[test]
+    fn preview_fit_box_leaves_a_comfortable_margin() {
+        assert_eq!(preview_fit_box(640, 480), (610, 450));
+        // Keep preview rendering valid even in an unusually small terminal.
+        assert_eq!(preview_fit_box(20, 20), (1, 1));
+    }
+
+    #[test]
+    fn preview_scale_fills_the_padded_viewport_at_default_zoom() {
+        let scale = preview_scale(100, 200, 640, 480, 1.0);
+        assert!(scale > 2.24 && scale < 2.25);
+        // The default fit enlarges small diagrams, while an explicit zoom still compounds it.
+        assert!(scale > 1.0);
+        assert!((preview_scale(100, 200, 640, 480, 1.25) - scale * 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn renders_png_for_preview() {
         let png = Renderer::new().png(FLOWCHART, 640, 480, 1.0).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(std::io::Cursor::new(&png));
+        let reader = decoder.read_info().unwrap();
+        // The small diagram is enlarged until its height reaches the padded boundary.
+        assert_eq!(reader.info().height, 450, "{:#?}", reader.info());
     }
 
     #[test]
