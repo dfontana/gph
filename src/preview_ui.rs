@@ -1,6 +1,9 @@
 use std::io;
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, window_size,
@@ -41,6 +44,13 @@ impl TerminalSession {
                 cleanup,
             );
         }
+        // Mouse capture drives click-and-drag panning of a zoomed preview.
+        if let Err(error) = execute!(stdout, EnableMouseCapture) {
+            return terminal_initialization_error(
+                format!("cannot capture the mouse: {error}"),
+                restore_terminal(alternate_screen),
+            );
+        }
 
         let backend = CrosstermBackend::new(stdout);
         match Terminal::with_options(backend, TerminalOptions { viewport }) {
@@ -78,14 +88,15 @@ fn terminal_initialization_error(
 }
 
 fn restore_terminal(alternate_screen: bool) -> Result<(), String> {
+    let mut stdout = io::stdout();
+    let mouse = execute!(stdout, DisableMouseCapture).map_err(|error| error.to_string());
     let screen = if alternate_screen {
-        let mut stdout = io::stdout();
         leave_alternate_screen(&mut stdout).map_err(|error| error.to_string())
     } else {
         Ok(())
     };
     let raw = disable_raw_mode().map_err(|error| error.to_string());
-    combine(screen, raw)
+    combine(combine(mouse, screen), raw)
 }
 
 fn leave_alternate_screen(out: &mut impl io::Write) -> io::Result<()> {
@@ -104,6 +115,13 @@ pub(crate) struct PreviewImage {
     displayed: bool,
     dirty: bool,
     zoom: f32,
+    /// How far the visible window is panned from center, in whole cells.
+    pan: (i32, i32),
+    /// Largest pan the current placement allows; refreshed on each display.
+    pan_limit: (i32, i32),
+    /// Whether the current pixels still need transmitting to Kitty. Panning leaves
+    /// this false so the image is only re-placed, never re-uploaded (no flicker).
+    needs_upload: bool,
 }
 
 impl PreviewImage {
@@ -114,12 +132,32 @@ impl PreviewImage {
             displayed: false,
             dirty: true,
             zoom: ZOOM_MIN,
+            pan: (0, 0),
+            pan_limit: (0, 0),
+            needs_upload: false,
         }
     }
 
     /// The magnification the source should be rasterized at; 1.0 fits the pane.
     pub(crate) fn zoom(&self) -> f32 {
         self.zoom
+    }
+
+    /// Slide the visible window by a mouse drag of `(dx, dy)` cells, moving the diagram
+    /// with the cursor and stopping at the image edges. Reports whether the view moved so
+    /// the caller can redraw only when it must.
+    pub(crate) fn pan(&mut self, dx: i32, dy: i32) -> bool {
+        let (limit_x, limit_y) = self.pan_limit;
+        let pan = (
+            (self.pan.0 - dx).clamp(-limit_x, limit_x),
+            (self.pan.1 - dy).clamp(-limit_y, limit_y),
+        );
+        if pan == self.pan {
+            return false;
+        }
+        self.pan = pan;
+        self.dirty = true;
+        true
     }
 
     /// Apply a zoom action, reporting whether it changed the magnification so the
@@ -141,17 +179,27 @@ impl PreviewImage {
             return false;
         }
         self.zoom = zoom;
+        // A fit leaves no room to pan, so recenter for the next zoom-in.
+        if zoom == ZOOM_MIN {
+            self.pan = (0, 0);
+        }
         self.dirty = true;
         true
     }
 
     pub(crate) fn show(&mut self, png: Vec<u8>) {
-        self.dirty |= self.png.as_ref() != Some(&png);
+        let changed = self.png.as_ref() != Some(&png);
+        self.dirty |= changed;
+        // New pixels must be transmitted; identical ones can be re-placed as-is.
+        self.needs_upload |= changed;
         self.png = Some(png);
     }
 
     pub(crate) fn clear(&mut self) {
-        self.dirty |= self.png.take().is_some();
+        if self.png.take().is_some() {
+            self.dirty = true;
+            self.needs_upload = true;
+        }
     }
 
     pub(crate) fn png(&self) -> Option<&[u8]> {
@@ -161,6 +209,8 @@ impl PreviewImage {
     /// Redraw after the terminal has invalidated graphics, such as after a resize.
     pub(crate) fn mark_dirty(&mut self) {
         self.dirty = true;
+        // A resize or graphics reset drops Kitty's copy, so the pixels must be re-sent.
+        self.needs_upload = true;
     }
 
     /// Display the current image even when its bytes have not changed.
@@ -187,14 +237,23 @@ impl PreviewImage {
             if self.displayed {
                 kitty::delete_image(self.id, out)?;
                 self.displayed = false;
+                // The image data is gone, so its next appearance must re-upload.
+                self.needs_upload = true;
             }
             return Ok(());
         }
 
         match self.png() {
             Some(png) => {
-                let placement = kitty::place_png(pane, png);
-                kitty::display_png(self.id, png, placement.cell, placement.crop, out)?;
+                let placement = kitty::place_png(pane, png, self.pan);
+                if self.needs_upload {
+                    kitty::display_png(self.id, png, placement.cell, placement.crop, out)?;
+                    self.needs_upload = false;
+                } else {
+                    // Pixels are already uploaded; just slide the visible window.
+                    kitty::place_image(self.id, placement.cell, placement.crop, out)?;
+                }
+                self.pan_limit = placement.pan_limit;
                 self.displayed = true;
             }
             None if self.displayed => {
@@ -229,6 +288,51 @@ pub(crate) fn zoom_action(event: &Event) -> Option<ZoomAction> {
         KeyCode::Char('-') | KeyCode::Char('_') => Some(ZoomAction::Out),
         KeyCode::Char('0') => Some(ZoomAction::Reset),
         _ => None,
+    }
+}
+
+/// Turns a left-button mouse drag into per-move cell deltas for panning.
+///
+/// Every terminal event is fed through `delta`; it remembers where the button went
+/// down and reports how far each subsequent drag moved, in whole cells.
+#[derive(Default)]
+pub(crate) struct DragTracker {
+    last: Option<(u16, u16)>,
+}
+
+impl DragTracker {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The cell delta of an in-progress left-drag, or `None` for any other event.
+    pub(crate) fn delta(&mut self, event: &Event) -> Option<(i32, i32)> {
+        let Event::Mouse(MouseEvent {
+            kind, column, row, ..
+        }) = event
+        else {
+            return None;
+        };
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.last = Some((*column, *row));
+                None
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let (last_column, last_row) = self.last?;
+                self.last = Some((*column, *row));
+                let delta = (
+                    i32::from(*column) - i32::from(last_column),
+                    i32::from(*row) - i32::from(last_row),
+                );
+                (delta != (0, 0)).then_some(delta)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.last = None;
+                None
+            }
+            _ => None,
+        }
     }
 }
 
@@ -331,6 +435,86 @@ mod tests {
         image.apply_zoom(ZoomAction::In);
         assert!(image.apply_zoom(ZoomAction::Out));
         assert_eq!(image.zoom(), 1.0);
+    }
+
+    #[test]
+    fn a_left_drag_reports_cell_deltas_between_moves() {
+        let mouse = |kind, column, row| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut drag = DragTracker::new();
+
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Down(MouseButton::Left), 10, 5)),
+            None
+        );
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Drag(MouseButton::Left), 13, 4)),
+            Some((3, -1))
+        );
+        // Deltas are measured from the previous move, not the button-down point.
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Drag(MouseButton::Left), 13, 4)),
+            None
+        );
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Drag(MouseButton::Left), 11, 4)),
+            Some((-2, 0))
+        );
+        // Releasing ends the drag, so a later move without a press reports nothing.
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Up(MouseButton::Left), 11, 4)),
+            None
+        );
+        assert_eq!(
+            drag.delta(&mouse(MouseEventKind::Drag(MouseButton::Left), 20, 20)),
+            None
+        );
+    }
+
+    #[test]
+    fn panning_moves_the_view_opposite_the_drag_and_clamps_to_the_limit() {
+        let mut image = PreviewImage::new();
+        // No placement has run, so there is no room to pan yet.
+        assert!(!image.pan(3, 3));
+
+        image.apply_zoom(ZoomAction::In);
+        image.pan_limit = (5, 5);
+        // Dragging right and down moves the window left and up (the diagram follows the cursor).
+        assert!(image.pan(2, 1));
+        assert_eq!(image.pan, (-2, -1));
+        // Panning stops at the limit rather than accumulating past it.
+        assert!(image.pan(-99, -99));
+        assert_eq!(image.pan, (5, 5));
+        assert!(!image.pan(-99, -99));
+
+        // Returning to a fit recenters the view for the next zoom-in.
+        assert!(image.apply_zoom(ZoomAction::Reset));
+        assert_eq!(image.pan, (0, 0));
+    }
+
+    #[test]
+    fn re_displaying_an_unchanged_image_replaces_it_without_re_uploading() {
+        let mut image = PreviewImage::new();
+        let pane = Rect::new(2, 3, 20, 10);
+
+        let mut first = Vec::new();
+        image.show(b"png".to_vec());
+        image.display(pane, &mut first).unwrap();
+        assert!(String::from_utf8(first).unwrap().contains("a=t,f=100,t=d,i="));
+
+        // A second display of the same pixels (as panning does) only re-places them.
+        let mut second = Vec::new();
+        image.display(pane, &mut second).unwrap();
+        let text = String::from_utf8(second).unwrap();
+        assert!(text.contains("a=p,i="));
+        assert!(!text.contains("a=t"));
+        assert!(!text.contains("a=d,d=I"));
     }
 
     #[test]

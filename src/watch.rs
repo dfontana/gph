@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::preview_ui::{
-    PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event, pane_pixels,
-    zoom_action,
+    DragTracker, PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event,
+    pane_pixels, zoom_action,
 };
 use crate::render::Renderer;
 
@@ -109,6 +109,7 @@ fn event_loop(
     state: &mut State,
     events: &Receiver<notify::Result<NotifyEvent>>,
 ) -> Result<(), String> {
+    let mut drag = DragTracker::new();
     refresh_and_draw(terminal, state)?;
     loop {
         if event::poll(Duration::from_millis(25)).map_err(|error| error.to_string())? {
@@ -119,6 +120,15 @@ fn event_loop(
             if let Some(action) = zoom_action(&event) {
                 if state.image.apply_zoom(action) {
                     refresh_and_draw(terminal, state)?;
+                }
+                continue;
+            }
+            if matches!(event, Event::Mouse(_)) {
+                // Panning re-places the cached image without re-rendering it.
+                if let Some((dx, dy)) = drag.delta(&event)
+                    && state.image.pan(dx, dy)
+                {
+                    redraw(terminal, state)?;
                 }
                 continue;
             }
@@ -172,7 +182,13 @@ fn refresh_and_draw(terminal: &mut PreviewTerminal, state: &mut State) -> Result
         state.viewport = viewport;
     }
     state.refresh(preview_pane(viewport));
+    redraw(terminal, state)
+}
 
+/// Repaint the frame and re-place the cached image, without re-rendering the source.
+///
+/// Used for panning, where only the visible window of an unchanged image moves.
+fn redraw(terminal: &mut PreviewTerminal, state: &mut State) -> Result<(), String> {
     // The buffer area is the absolute screen rectangle that Ratatui actually drew,
     // so it is the coordinate system Kitty needs for cursor placement.
     let preview = {
@@ -210,8 +226,9 @@ fn draw(frame: &mut ratatui::Frame, state: &State) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!(
-                " Watching for changes ·{} +/- zoom · Ctrl-C quit ",
+                " Watching for changes ·{} +/- zoom{} · Ctrl-C quit ",
                 zoom_label(state.image.zoom()),
+                pan_hint(state.image.zoom()),
             ),
             Style::default().fg(Color::DarkGray),
         ))),
@@ -230,6 +247,15 @@ fn zoom_label(zoom: f32) -> String {
         String::new()
     } else {
         format!(" {}% ·", (zoom * 100.0).round() as u32)
+    }
+}
+
+/// A panning hint shown only while zoomed in, where there is room to pan.
+fn pan_hint(zoom: f32) -> &'static str {
+    if (zoom - 1.0).abs() < 1e-3 {
+        ""
+    } else {
+        " · drag to pan"
     }
 }
 

@@ -56,24 +56,30 @@ pub struct Crop {
     pub height: u32,
 }
 
-/// Where a PNG lands in the pane: the cell rectangle to draw into, plus the source
-/// window to draw from when the image is larger than the pane.
+/// Where a PNG lands in the pane: the cell rectangle to draw into, the source
+/// window to draw from when the image is larger than the pane, and how far the
+/// caller may pan that window from center before it hits an edge.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Placement {
     pub cell: Rect,
     pub crop: Option<Crop>,
+    /// Largest pan the caller can apply, as `(cells_x, cells_y)` in either
+    /// direction from the centered window. Zero when the image fits the pane.
+    pub pan_limit: (i32, i32),
 }
 
 /// Center a PNG within `pane`, cropping to the pane when the image overflows it.
 ///
 /// Kitty places a natural-size image from the cursor cell. A preview rendered at
 /// zoom 1 is never larger than its pane, so it is simply centered; a zoomed render
-/// can exceed the pane, so its centered pane-sized window is cropped out and the rest
-/// clipped.
-pub fn place_png(pane: Rect, png: &[u8]) -> Placement {
+/// can exceed the pane, so its pane-sized window is cropped out and the rest clipped.
+/// `pan` slides that window off center by whole cells so the viewer can move around a
+/// zoomed diagram; it is clamped to the image and ignored when nothing overflows.
+pub fn place_png(pane: Rect, png: &[u8], pan: (i32, i32)) -> Placement {
     let uncropped = Placement {
         cell: pane,
         crop: None,
+        pan_limit: (0, 0),
     };
     let Some((image_width, image_height)) = png_dimensions(png) else {
         return uncropped;
@@ -86,7 +92,7 @@ pub fn place_png(pane: Rect, png: &[u8]) -> Placement {
     }
     let cell_width = u32::from(terminal.width) / u32::from(terminal.columns);
     let cell_height = u32::from(terminal.height) / u32::from(terminal.rows);
-    place(pane, image_width, image_height, cell_width, cell_height)
+    place(pane, image_width, image_height, cell_width, cell_height, pan)
 }
 
 fn place(
@@ -95,11 +101,13 @@ fn place(
     image_height: u32,
     cell_width: u32,
     cell_height: u32,
+    pan: (i32, i32),
 ) -> Placement {
     if cell_width == 0 || cell_height == 0 {
         return Placement {
             cell: pane,
             crop: None,
+            pan_limit: (0, 0),
         };
     }
     let full_columns = image_width.div_ceil(cell_width);
@@ -112,20 +120,42 @@ fn place(
         columns as u16,
         rows as u16,
     );
-    let crop =
-        (full_columns > u32::from(pane.width) || full_rows > u32::from(pane.height)).then(|| {
-            // Snap the window to whole cells so the visible pixels map one-to-one and
-            // stay crisp, then clamp to the image for panes that outsize it.
-            let width = (columns * cell_width).min(image_width);
-            let height = (rows * cell_height).min(image_height);
-            Crop {
-                x: (image_width - width) / 2,
-                y: (image_height - height) / 2,
-                width,
-                height,
-            }
-        });
-    Placement { cell, crop }
+    if full_columns <= u32::from(pane.width) && full_rows <= u32::from(pane.height) {
+        return Placement {
+            cell,
+            crop: None,
+            pan_limit: (0, 0),
+        };
+    }
+    // Snap the window to whole cells so the visible pixels map one-to-one and stay
+    // crisp, then clamp to the image for panes that outsize it.
+    let width = (columns * cell_width).min(image_width);
+    let height = (rows * cell_height).min(image_height);
+    // The window is centered by default; `pan` shifts it by whole cells and the result
+    // is clamped so it never leaves the image.
+    let (center_x, center_y) = ((image_width - width) / 2, (image_height - height) / 2);
+    let x = pan_axis(center_x, pan.0, cell_width, image_width - width);
+    let y = pan_axis(center_y, pan.1, cell_height, image_height - height);
+    Placement {
+        cell,
+        crop: Some(Crop {
+            x,
+            y,
+            width,
+            height,
+        }),
+        // The window can travel from center to either edge, one cell at a time.
+        pan_limit: (
+            center_x.div_ceil(cell_width) as i32,
+            center_y.div_ceil(cell_height) as i32,
+        ),
+    }
+}
+
+/// Offset a centered crop origin by `pan` cells, clamped to `[0, slack]`.
+fn pan_axis(center: u32, pan: i32, cell: u32, slack: u32) -> u32 {
+    let shifted = i64::from(center) + i64::from(pan) * i64::from(cell);
+    shifted.clamp(0, i64::from(slack)) as u32
 }
 
 /// Replace this preview instance's image and place it at its natural aspect ratio.
@@ -144,9 +174,25 @@ pub fn display_png(
     if cell.width == 0 || cell.height == 0 {
         return Ok(());
     }
-
     delete_image(image_id, out)?;
     upload_png(image_id, png, out)?;
+    place_image(image_id, cell, crop, out)
+}
+
+/// Re-place an already-transmitted image without re-sending its pixels.
+///
+/// Panning a zoomed preview only slides the visible source window, so repeating the
+/// placement with a new crop moves the image in place. Skipping the delete-and-re-upload
+/// that [`display_png`] performs is what keeps panning flicker-free.
+pub fn place_image(
+    image_id: ImageId,
+    cell: Rect,
+    crop: Option<Crop>,
+    out: &mut impl Write,
+) -> io::Result<()> {
+    if cell.width == 0 || cell.height == 0 {
+        return Ok(());
+    }
     let mut command = format!("a=p,i={},p={PLACEMENT_ID},C=1,q=2", image_id.0);
     if let Some(crop) = crop {
         use std::fmt::Write as _;
@@ -235,10 +281,11 @@ mod tests {
     #[test]
     fn centers_natural_size_pngs_in_the_available_pane() {
         assert_eq!(
-            place(Rect::new(10, 5, 80, 20), 160, 80, 8, 16),
+            place(Rect::new(10, 5, 80, 20), 160, 80, 8, 16, (0, 0)),
             Placement {
                 cell: Rect::new(40, 12, 20, 5),
                 crop: None,
+                pan_limit: (0, 0),
             },
         );
     }
@@ -246,7 +293,7 @@ mod tests {
     #[test]
     fn oversized_pngs_fill_the_pane_and_crop_their_overflow_to_its_center() {
         assert_eq!(
-            place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16),
+            place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16, (0, 0)),
             Placement {
                 cell: Rect::new(10, 5, 80, 20),
                 // 80 cols * 8px = 640, 20 rows * 16px = 320, centered in a 2000x800 image.
@@ -256,8 +303,21 @@ mod tests {
                     width: 640,
                     height: 320,
                 }),
+                // Half of the 1360x480 slack, in 8x16 cells: 680/8, 240/16.
+                pan_limit: (85, 15),
             },
         );
+    }
+
+    #[test]
+    fn panning_slides_the_crop_window_and_clamps_it_to_the_image_edges() {
+        let at = |pan| place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16, pan).crop.unwrap();
+        // Ten cells right and three down move the window by 80px and 48px from center.
+        assert_eq!((at((10, 3)).x, at((10, 3)).y), (760, 288));
+        assert_eq!((at((-10, -3)).x, at((-10, -3)).y), (600, 192));
+        // Panning past the limit stops at the image edge rather than spilling over.
+        assert_eq!((at((999, 999)).x, at((999, 999)).y), (1_360, 480));
+        assert_eq!((at((-999, -999)).x, at((-999, -999)).y), (0, 0));
     }
 
     #[test]
@@ -301,6 +361,30 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("a=p,i=101,p=1,C=1,q=2,x=680,y=240,w=640,h=320"));
+        assert_all_commands_suppress_responses(&text);
+    }
+
+    #[test]
+    fn place_image_re_places_without_transmitting_or_deleting() {
+        let mut bytes = Vec::new();
+        place_image(
+            FIRST_PREVIEW_IMAGE,
+            Rect::new(4, 2, 10, 5),
+            Some(Crop {
+                x: 5,
+                y: 6,
+                width: 80,
+                height: 48,
+            }),
+            &mut bytes,
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("a=p,i=101,p=1,C=1,q=2,x=5,y=6,w=80,h=48"));
+        // Panning must not re-upload or drop the image; that is what caused the flicker.
+        assert!(!text.contains("a=t"));
+        assert!(!text.contains("a=d"));
+        assert!(text.contains("\x1b[3;5H"));
         assert_all_commands_suppress_responses(&text);
     }
 

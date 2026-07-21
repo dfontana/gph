@@ -9,8 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::preview_ui::{
-    PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event, pane_pixels,
-    zoom_action,
+    DragTracker, PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event,
+    pane_pixels, zoom_action,
 };
 use crate::render::Renderer;
 
@@ -202,7 +202,7 @@ impl LspPreviewState {
         if (zoom - 1.0).abs() < 1e-3 {
             String::new()
         } else {
-            format!(" · {}% (+/- zoom)", (zoom * 100.0).round() as u32)
+            format!(" · {}% (+/- zoom · drag to pan)", (zoom * 100.0).round() as u32)
         }
     }
 }
@@ -225,6 +225,7 @@ fn lsp_preview_loop(
     let mut dirty = true;
     let mut preview_dirty = true;
     let mut deadline = None;
+    let mut drag = DragTracker::new();
 
     loop {
         let mut changed = false;
@@ -284,6 +285,15 @@ fn lsp_preview_loop(
                 preview_dirty = true;
                 deadline = Some(Instant::now());
                 state.image.mark_dirty();
+                dirty = true;
+            }
+            continue;
+        }
+        if matches!(event, Event::Mouse(_)) {
+            // Panning only re-places the existing image, so it skips the render.
+            if let Some((dx, dy)) = drag.delta(&event)
+                && state.image.pan(dx, dy)
+            {
                 dirty = true;
             }
             continue;
