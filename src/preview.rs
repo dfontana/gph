@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::preview_ui::{
     DragTracker, PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event,
-    pane_pixels, zoom_action,
+    pane_pixels, scroll_delta, zoom_action,
 };
 use crate::render::Renderer;
 
@@ -192,7 +192,7 @@ impl LspPreviewState {
     fn header_right(&self) -> String {
         let zoom = self.image.zoom();
         format!(
-            " {}% · +/- zoom · drag to pan ",
+            " {}% · +/- zoom · drag or scroll to pan ",
             (zoom * 100.0).round() as u32
         )
     }
@@ -293,7 +293,8 @@ fn lsp_preview_loop(
         }
         if matches!(event, Event::Mouse(_)) {
             // Panning only re-places the existing image, so it skips the render.
-            if let Some((dx, dy)) = drag.delta(&event)
+            // A drag pans by cursor motion; a scroll/trackpad swipe by notch.
+            if let Some((dx, dy)) = drag.delta(&event).or_else(|| scroll_delta(&event))
                 && state.image.pan(dx, dy)
             {
                 dirty = true;

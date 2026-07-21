@@ -336,6 +336,37 @@ impl DragTracker {
     }
 }
 
+/// The pan delta, in cells, for a scroll-wheel or trackpad event, or `None` for
+/// any other event.
+///
+/// Scrolling moves the view the way scrolling a document does — a wheel-down
+/// reveals the lower part of the diagram, opposite a same-direction drag.
+/// Holding Shift turns a vertical wheel into horizontal panning for mice that
+/// lack a tilt wheel.
+pub(crate) fn scroll_delta(event: &Event) -> Option<(i32, i32)> {
+    /// Cells moved per scroll event. One keeps a trackpad's flurry of events
+    /// feeling smooth, at the cost of a mouse wheel travelling a cell per notch.
+    const STEP: i32 = 1;
+    let Event::Mouse(MouseEvent {
+        kind, modifiers, ..
+    }) = event
+    else {
+        return None;
+    };
+    let vertical = match kind {
+        MouseEventKind::ScrollDown => -STEP,
+        MouseEventKind::ScrollUp => STEP,
+        MouseEventKind::ScrollRight => return Some((-STEP, 0)),
+        MouseEventKind::ScrollLeft => return Some((STEP, 0)),
+        _ => return None,
+    };
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        Some((vertical, 0))
+    } else {
+        Some((0, vertical))
+    }
+}
+
 pub(crate) fn pane_pixels(pane: Rect) -> (u32, u32) {
     let fallback = (
         (u32::from(pane.width) * 8).max(1),
@@ -475,6 +506,44 @@ mod tests {
             drag.delta(&mouse(MouseEventKind::Drag(MouseButton::Left), 20, 20)),
             None
         );
+    }
+
+    #[test]
+    fn scrolling_pans_along_the_wheel_axis_and_shift_flips_it_horizontal() {
+        let scroll = |kind, modifiers| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers,
+            })
+        };
+
+        // A wheel-down scrolls the view down the diagram, opposite a downward drag.
+        assert_eq!(
+            scroll_delta(&scroll(MouseEventKind::ScrollDown, KeyModifiers::NONE)),
+            Some((0, -1))
+        );
+        assert_eq!(
+            scroll_delta(&scroll(MouseEventKind::ScrollUp, KeyModifiers::NONE)),
+            Some((0, 1))
+        );
+        // A tilt wheel (or trackpad) pans horizontally on its own.
+        assert_eq!(
+            scroll_delta(&scroll(MouseEventKind::ScrollRight, KeyModifiers::NONE)),
+            Some((-1, 0))
+        );
+        // Shift redirects a vertical wheel into horizontal panning.
+        assert_eq!(
+            scroll_delta(&scroll(MouseEventKind::ScrollDown, KeyModifiers::SHIFT)),
+            Some((-1, 0))
+        );
+        // Non-scroll mouse events and key events yield no pan.
+        assert_eq!(
+            scroll_delta(&scroll(MouseEventKind::Moved, KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(scroll_delta(&Event::FocusGained), None);
     }
 
     #[test]
