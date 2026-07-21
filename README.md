@@ -3,7 +3,9 @@
 `gph` is a small, Kitty-native Mermaid previewer. It uses
 [merman](https://github.com/Latias94/merman) for parsing, layout, SVG, and PNG
 rendering, watches source files for changes, shows a live Kitty image preview, and
-renders SVG, PNG, JPEG, and PDF files.
+renders SVG, PNG, JPEG, and PDF files. Every output uses a Rosé Pine Dawn
+[merman host theme profile](https://github.com/Latias94/merman/blob/main/crates/merman/examples/example_12_host_theme_profile.rs),
+not custom CSS; their page backgrounds remain transparent for preview and exported images.
 
 There is no custom diagram language in the CLI, manual node positioning, mouse
 interaction, or browser/Node runtime. Mermaid decides all layout. The binary
@@ -36,14 +38,18 @@ before rerendering. The preview starts below the command's existing terminal
 output and grows downward when its pane is resized; it never enters the alternate
 screen. Invalid Mermaid leaves the
 last valid preview visible and reports the error in the preview border. Press
-`Ctrl-C` or `Ctrl-Q` to quit.
+`+` to zoom in, `-` to zoom out, and `0` to return to a comfortably padded pane fit; the current
+magnification shows in the status line. While zoomed in, click and drag with the
+mouse to pan around the diagram. Press `Ctrl-C` or `Ctrl-Q` to quit.
 
 ## Preview unsaved Helix buffers
 
-In a Kitty pane at the workspace root, start the preview daemon before opening
-Helix. LSP preview support is Unix-only because it uses Unix-domain sockets, and
-requires a non-empty `XDG_RUNTIME_DIR`; `gph lsp` stores per-user runtime files
-there. Helix must be launched from the same workspace and user session.
+In a Kitty pane, start the preview daemon before opening Helix. LSP preview
+support is Unix-only because it uses Unix-domain sockets. A single daemon per
+user serves every workspace, so you can start it from any directory and connect
+from anywhere in the same user session. `gph lsp` stores its socket in a
+per-user runtime directory (`XDG_RUNTIME_DIR` on Linux, `~/Library/Caches` on
+macOS).
 
 ```sh
 gph lsp
@@ -62,13 +68,15 @@ language-servers = ["merman-lsp", "gph-preview"]
 ```
 
 Helix starts `gph lsp-connect` automatically for each Mermaid buffer; it bridges
-Helix's standard input/output to that workspace socket. The daemon shows the
-most recently changed open document and uses only the full unsaved text supplied
+Helix's standard input/output to the shared daemon socket. The daemon shows the
+most recently changed open document across every connected workspace and uses only the full unsaved text supplied
 by LSP `didOpen` and `didChange` notifications—it never reads the buffer from
 disk. Closing a buffer returns the preview to the next most recent open
 document, and renders debounce briefly after the final edit. `gph` advertises
 LSP full text synchronization (`openClose` and `change = 1`) only, so
-`merman-lsp` remains the diagnostics provider. Quit the Kitty preview pane with
+`merman-lsp` remains the diagnostics provider. `+`/`-` zoom the preview and `0`
+returns it to a comfortably padded pane fit, and click-and-drag pans a zoomed diagram, matching
+`gph watch`. Quit the Kitty preview pane with
 `Ctrl-Q` or `Ctrl-C`; the socket is removed and a later Helix connection reports
 that `gph lsp` needs to be started again.
 

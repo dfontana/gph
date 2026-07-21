@@ -14,6 +14,7 @@ path = "src/main.rs"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
+dirs = "6.0.0"
 fs2 = "0.4"
 merman = { version = "=0.8.0-alpha.3", default-features = false, features = ["core-full", "core-host", "raster"] }
 notify = "8.2"
@@ -21,3 +22,6 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm_0
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time"] }
 tower-lsp-server = { version = "0.23", default-features = false, features = ["runtime-tokio"] }
 winnow = "1.0.4"
+
+[dev-dependencies]
+png = "0.18"

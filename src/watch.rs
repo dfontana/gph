@@ -1,22 +1,20 @@
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, window_size};
+use crossterm::event::{self, Event};
 use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::{TerminalOptions, Viewport};
 
-use crate::kitty;
+use crate::preview_ui::{
+    DragTracker, PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event,
+    pane_pixels, zoom_action,
+};
 use crate::render::Renderer;
 
 const CHANGE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -24,8 +22,7 @@ const CHANGE_DEBOUNCE: Duration = Duration::from_millis(150);
 struct State {
     path: PathBuf,
     renderer: Renderer,
-    image_id: kitty::ImageId,
-    preview: Option<Vec<u8>>,
+    image: PreviewImage,
     error: Option<String>,
     viewport_top: u16,
     viewport: Rect,
@@ -36,8 +33,7 @@ impl State {
         Self {
             path,
             renderer: Renderer::new(),
-            image_id: kitty::new_image_id(),
-            preview: None,
+            image: PreviewImage::new(),
             error: None,
             viewport_top,
             viewport,
@@ -53,9 +49,9 @@ impl State {
             }
         };
         let (width, height) = pane_pixels(pane);
-        match self.renderer.png(&source, width, height) {
+        match self.renderer.png(&source, width, height, self.image.zoom()) {
             Ok(png) => {
-                self.preview = Some(png);
+                self.image.show(png);
                 self.error = None;
             }
             Err(error) => self.error = Some(error),
@@ -90,19 +86,10 @@ pub fn run(path: PathBuf) -> Result<(), String> {
         .map_err(|error| format!("cannot determine terminal size: {error}"))?;
     let viewport = watch_viewport(viewport_top, width, height);
 
-    enable_raw_mode().map_err(|error| format!("cannot enable raw mode: {error}"))?;
-    let stdout = io::stdout();
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Fixed(viewport),
-        },
-    )
-    .map_err(|error| error.to_string())?;
+    let mut session = TerminalSession::fixed(viewport)?;
     let mut state = State::new(source, viewport_top, viewport);
-    let result = event_loop(&mut terminal, &mut state, &event_rx);
-    let cleanup = cleanup(&mut terminal, state.image_id);
+    let result = event_loop(session.terminal(), &mut state, &event_rx);
+    let cleanup = session.cleanup(&mut state.image);
     combine(result, cleanup)
 }
 
@@ -118,21 +105,35 @@ fn canonical_file(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn event_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut PreviewTerminal,
     state: &mut State,
     events: &Receiver<notify::Result<NotifyEvent>>,
 ) -> Result<(), String> {
+    let mut drag = DragTracker::new();
     refresh_and_draw(terminal, state)?;
     loop {
         if event::poll(Duration::from_millis(25)).map_err(|error| error.to_string())? {
-            match event::read().map_err(|error| error.to_string())? {
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('c') | KeyCode::Char('q'),
-                    modifiers: KeyModifiers::CONTROL,
-                    ..
-                }) => return Ok(()),
-                Event::Resize(_, _) => refresh_and_draw(terminal, state)?,
-                _ => {}
+            let event = event::read().map_err(|error| error.to_string())?;
+            if is_quit_event(&event) {
+                return Ok(());
+            }
+            if let Some(action) = zoom_action(&event) {
+                if state.image.apply_zoom(action) {
+                    refresh_and_draw(terminal, state)?;
+                }
+                continue;
+            }
+            if matches!(event, Event::Mouse(_)) {
+                // Panning re-places the cached image without re-rendering it.
+                if let Some((dx, dy)) = drag.delta(&event)
+                    && state.image.pan(dx, dy)
+                {
+                    redraw(terminal, state)?;
+                }
+                continue;
+            }
+            if matches!(event, Event::Resize(_, _)) {
+                refresh_and_draw(terminal, state)?;
             }
         }
 
@@ -171,10 +172,7 @@ fn event_affects(event: &NotifyEvent, source: &Path) -> bool {
     event.paths.iter().any(|path| path == source)
 }
 
-fn refresh_and_draw(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &mut State,
-) -> Result<(), String> {
+fn refresh_and_draw(terminal: &mut PreviewTerminal, state: &mut State) -> Result<(), String> {
     let size = terminal.size().map_err(|error| error.to_string())?;
     let viewport = watch_viewport(state.viewport_top, size.width, size.height);
     if viewport != state.viewport {
@@ -184,7 +182,13 @@ fn refresh_and_draw(
         state.viewport = viewport;
     }
     state.refresh(preview_pane(viewport));
+    redraw(terminal, state)
+}
 
+/// Repaint the frame and re-place the cached image, without re-rendering the source.
+///
+/// Used for panning, where only the visible window of an unchanged image moves.
+fn redraw(terminal: &mut PreviewTerminal, state: &mut State) -> Result<(), String> {
     // The buffer area is the absolute screen rectangle that Ratatui actually drew,
     // so it is the coordinate system Kitty needs for cursor placement.
     let preview = {
@@ -193,14 +197,11 @@ fn refresh_and_draw(
             .map_err(|error| error.to_string())?;
         preview_pane(frame.buffer.area)
     };
-    if let Some(png) = state.preview.as_deref() {
-        kitty::display_png(
-            state.image_id,
-            png,
-            kitty::centered_pane(preview, png),
-            terminal.backend_mut(),
-        )
-        .map_err(|error| format!("Kitty preview failed: {error}"))?;
+    if state.image.png().is_some() {
+        state
+            .image
+            .display(preview, terminal.backend_mut())
+            .map_err(|error| format!("Kitty preview failed: {error}"))?;
     }
     Ok(())
 }
@@ -224,7 +225,11 @@ fn draw(frame: &mut ratatui::Frame, state: &State) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Watching for changes · Ctrl-C quit ",
+            format!(
+                " Watching for changes ·{} +/- zoom{} · Ctrl-C quit ",
+                zoom_label(state.image.zoom()),
+                pan_hint(state.image.zoom()),
+            ),
             Style::default().fg(Color::DarkGray),
         ))),
         Rect::new(
@@ -236,6 +241,24 @@ fn draw(frame: &mut ratatui::Frame, state: &State) {
     );
 }
 
+/// The current magnification for the status hint, blank at an exact fit.
+fn zoom_label(zoom: f32) -> String {
+    if (zoom - 1.0).abs() < 1e-3 {
+        String::new()
+    } else {
+        format!(" {}% ·", (zoom * 100.0).round() as u32)
+    }
+}
+
+/// A panning hint shown only while zoomed in, where there is room to pan.
+fn pan_hint(zoom: f32) -> &'static str {
+    if (zoom - 1.0).abs() < 1e-3 {
+        ""
+    } else {
+        " · drag to pan"
+    }
+}
+
 fn watch_viewport(viewport_top: u16, width: u16, terminal_height: u16) -> Rect {
     let top = viewport_top.min(terminal_height.saturating_sub(1));
     Rect::new(0, top, width, terminal_height.saturating_sub(top))
@@ -243,44 +266,6 @@ fn watch_viewport(viewport_top: u16, width: u16, terminal_height: u16) -> Rect {
 
 fn preview_pane(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
-}
-
-pub(crate) fn pane_pixels(pane: Rect) -> (u32, u32) {
-    let fallback = (
-        (u32::from(pane.width) * 8).max(1),
-        (u32::from(pane.height) * 16).max(1),
-    );
-    let Ok(size) = window_size() else {
-        return fallback;
-    };
-    if size.columns == 0 || size.rows == 0 || size.width == 0 || size.height == 0 {
-        return fallback;
-    }
-    (
-        (u32::from(size.width) * u32::from(pane.width) / u32::from(size.columns)).max(1),
-        (u32::from(size.height) * u32::from(pane.height) / u32::from(size.rows)).max(1),
-    )
-}
-
-pub(crate) fn cleanup(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    image_id: kitty::ImageId,
-) -> Result<(), String> {
-    let image =
-        kitty::delete_image(image_id, terminal.backend_mut()).map_err(|error| error.to_string());
-    let raw = disable_raw_mode().map_err(|error| error.to_string());
-    combine(image, raw)
-}
-
-pub(crate) fn combine(
-    primary: Result<(), String>,
-    cleanup: Result<(), String>,
-) -> Result<(), String> {
-    match (primary, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(primary), Err(cleanup)) => Err(format!("{primary}; cleanup failed: {cleanup}")),
-    }
 }
 
 #[cfg(test)]
