@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::preview_ui::{
     PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event, pane_pixels,
+    zoom_action,
 };
 use crate::render::Renderer;
 
@@ -38,6 +39,7 @@ struct PreviewCache {
     source: String,
     png: Vec<u8>,
     size: (u32, u32),
+    zoom: f32,
 }
 
 struct PreviewDocument {
@@ -121,10 +123,11 @@ impl LspPreviewState {
             self.clear_preview();
             return;
         };
+        let zoom = self.image.zoom();
         let source = self.documents[&key].source.clone();
-        match self.renderer.png(&source, width, height) {
+        match self.renderer.png(&source, width, height, zoom) {
             Ok(png) => {
-                self.set_preview(&key, source, png, size);
+                self.set_preview(&key, source, png, size, zoom);
                 self.render_error = None;
             }
             Err(error) => {
@@ -133,13 +136,14 @@ impl LspPreviewState {
                     self.clear_preview();
                     return;
                 };
-                if cache.size != size {
-                    let Ok(png) = self.renderer.png(&cache.source, width, height) else {
+                if cache.size != size || cache.zoom != zoom {
+                    let Ok(png) = self.renderer.png(&cache.source, width, height, zoom) else {
                         self.clear_preview();
                         return;
                     };
                     cache.png = png;
                     cache.size = size;
+                    cache.zoom = zoom;
                     self.documents.get_mut(&key).unwrap().cache = Some(cache.clone());
                 }
                 self.show_preview(cache.png);
@@ -154,11 +158,19 @@ impl LspPreviewState {
             .map(|(key, _)| key.clone())
     }
 
-    fn set_preview(&mut self, key: &(u64, String), source: String, png: Vec<u8>, size: (u32, u32)) {
+    fn set_preview(
+        &mut self,
+        key: &(u64, String),
+        source: String,
+        png: Vec<u8>,
+        size: (u32, u32),
+        zoom: f32,
+    ) {
         self.documents.get_mut(key).unwrap().cache = Some(PreviewCache {
             source,
             png: png.clone(),
             size,
+            zoom,
         });
         self.show_preview(png);
     }
@@ -175,9 +187,22 @@ impl LspPreviewState {
         if let Some(error) = &self.render_error {
             return error.clone();
         }
+        let zoom = self.zoom_label();
         match self.selected() {
-            Some((uri, _)) => format!(" {} open document(s) · {uri}", self.documents.len()),
-            None => " Waiting for a Mermaid document from an LSP client ".to_string(),
+            Some((uri, _)) => {
+                format!(" {} open document(s) · {uri}{zoom}", self.documents.len())
+            }
+            None => format!(" Waiting for a Mermaid document from an LSP client{zoom} "),
+        }
+    }
+
+    /// A trailing zoom hint for the status line, blank at an exact fit.
+    fn zoom_label(&self) -> String {
+        let zoom = self.image.zoom();
+        if (zoom - 1.0).abs() < 1e-3 {
+            String::new()
+        } else {
+            format!(" · {}% (+/- zoom)", (zoom * 100.0).round() as u32)
         }
     }
 }
@@ -221,9 +246,8 @@ fn lsp_preview_loop(
 
         if preview_dirty && deadline.is_none_or(|time| Instant::now() >= time) {
             let size = terminal.size().map_err(|error| error.to_string())?;
-            state.render(pane_pixels(
-                lsp_preview_panes(Rect::new(0, 0, size.width, size.height)).preview,
-            ));
+            let pane = lsp_preview_panes(Rect::new(0, 0, size.width, size.height)).preview;
+            state.render(pane_pixels(pane));
             preview_dirty = false;
             deadline = None;
             dirty = true;
@@ -254,6 +278,15 @@ fn lsp_preview_loop(
         let event = event::read().map_err(|error| error.to_string())?;
         if is_quit_event(&event) {
             return Ok(());
+        }
+        if let Some(action) = zoom_action(&event) {
+            if state.image.apply_zoom(action) {
+                preview_dirty = true;
+                deadline = Some(Instant::now());
+                state.image.mark_dirty();
+                dirty = true;
+            }
+            continue;
         }
         if matches!(event, Event::Resize(_, _)) {
             terminal.clear().map_err(|error| error.to_string())?;

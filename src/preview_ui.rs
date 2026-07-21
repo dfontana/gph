@@ -92,12 +92,18 @@ fn leave_alternate_screen(out: &mut impl io::Write) -> io::Result<()> {
     execute!(out, LeaveAlternateScreen)
 }
 
+/// Smallest and largest magnification the preview allows, and the per-keystroke ratio.
+const ZOOM_MIN: f32 = 1.0;
+const ZOOM_MAX: f32 = 8.0;
+const ZOOM_STEP: f32 = 1.25;
+
 /// The Kitty image currently owned by one preview session.
 pub(crate) struct PreviewImage {
     id: kitty::ImageId,
     png: Option<Vec<u8>>,
     displayed: bool,
     dirty: bool,
+    zoom: f32,
 }
 
 impl PreviewImage {
@@ -107,7 +113,36 @@ impl PreviewImage {
             png: None,
             displayed: false,
             dirty: true,
+            zoom: ZOOM_MIN,
         }
+    }
+
+    /// The magnification the source should be rasterized at; 1.0 fits the pane.
+    pub(crate) fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    /// Apply a zoom action, reporting whether it changed the magnification so the
+    /// caller can re-render only when it must.
+    pub(crate) fn apply_zoom(&mut self, action: ZoomAction) -> bool {
+        let zoom = match action {
+            ZoomAction::In => self.zoom * ZOOM_STEP,
+            ZoomAction::Out => self.zoom / ZOOM_STEP,
+            ZoomAction::Reset => ZOOM_MIN,
+        };
+        let zoom = zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        // Snap back to an exact fit so leaving zoom always restores the untouched preview.
+        let zoom = if (zoom - ZOOM_MIN).abs() < 1e-3 {
+            ZOOM_MIN
+        } else {
+            zoom
+        };
+        if (zoom - self.zoom).abs() < 1e-6 {
+            return false;
+        }
+        self.zoom = zoom;
+        self.dirty = true;
+        true
     }
 
     pub(crate) fn show(&mut self, png: Vec<u8>) {
@@ -158,7 +193,8 @@ impl PreviewImage {
 
         match self.png() {
             Some(png) => {
-                kitty::display_png(self.id, png, kitty::centered_pane(pane, png), out)?;
+                let placement = kitty::place_png(pane, png);
+                kitty::display_png(self.id, png, placement.cell, placement.crop, out)?;
                 self.displayed = true;
             }
             None if self.displayed => {
@@ -172,6 +208,27 @@ impl PreviewImage {
 
     fn cleanup(&mut self, out: &mut impl io::Write) -> Result<(), String> {
         kitty::delete_image(self.id, out).map_err(|error| error.to_string())
+    }
+}
+
+/// A magnification change requested from the keyboard.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZoomAction {
+    In,
+    Out,
+    Reset,
+}
+
+/// Map a key event to a zoom action: `+`/`=` in, `-`/`_` out, `0` back to fit.
+pub(crate) fn zoom_action(event: &Event) -> Option<ZoomAction> {
+    let Event::Key(KeyEvent { code, .. }) = event else {
+        return None;
+    };
+    match code {
+        KeyCode::Char('+') | KeyCode::Char('=') => Some(ZoomAction::In),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(ZoomAction::Out),
+        KeyCode::Char('0') => Some(ZoomAction::Reset),
+        _ => None,
     }
 }
 
@@ -235,6 +292,45 @@ mod tests {
         assert!(is_quit_event(&quit));
         assert!(!is_quit_event(&plain));
         assert!(!is_quit_event(&other));
+    }
+
+    #[test]
+    fn zoom_keys_map_to_their_actions() {
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(zoom_action(&key(KeyCode::Char('+'))), Some(ZoomAction::In));
+        assert_eq!(zoom_action(&key(KeyCode::Char('='))), Some(ZoomAction::In));
+        assert_eq!(zoom_action(&key(KeyCode::Char('-'))), Some(ZoomAction::Out));
+        assert_eq!(zoom_action(&key(KeyCode::Char('_'))), Some(ZoomAction::Out));
+        assert_eq!(
+            zoom_action(&key(KeyCode::Char('0'))),
+            Some(ZoomAction::Reset)
+        );
+        assert_eq!(zoom_action(&key(KeyCode::Char('x'))), None);
+    }
+
+    #[test]
+    fn zoom_steps_clamp_and_snap_back_to_a_fit() {
+        let mut image = PreviewImage::new();
+        assert_eq!(image.zoom(), 1.0);
+        // Already at the minimum, so zooming out is a no-op.
+        assert!(!image.apply_zoom(ZoomAction::Out));
+
+        assert!(image.apply_zoom(ZoomAction::In));
+        assert!(image.zoom() > 1.0);
+
+        for _ in 0..64 {
+            image.apply_zoom(ZoomAction::In);
+        }
+        assert_eq!(image.zoom(), ZOOM_MAX);
+        assert!(!image.apply_zoom(ZoomAction::In));
+
+        assert!(image.apply_zoom(ZoomAction::Reset));
+        assert_eq!(image.zoom(), 1.0);
+
+        // A single step out from the fit snaps exactly back to it.
+        image.apply_zoom(ZoomAction::In);
+        assert!(image.apply_zoom(ZoomAction::Out));
+        assert_eq!(image.zoom(), 1.0);
     }
 
     #[test]

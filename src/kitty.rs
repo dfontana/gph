@@ -43,71 +43,124 @@ pub fn delete_image(image_id: ImageId, out: &mut impl Write) -> io::Result<()> {
     out.flush()
 }
 
-/// Return the cell-aligned location that centers a PNG within `pane`.
+/// A source-pixel rectangle cropped out of a PNG before it is placed.
 ///
-/// Kitty places a natural-size image from the cursor cell. Rasterized previews can
-/// be smaller than their available pane, so position their top-left cell here rather
-/// than pinning every image to the pane's upper-left corner.
-pub fn centered_pane(pane: Rect, png: &[u8]) -> Rect {
+/// Kitty displays only this window of the image, letting an oversized (zoomed)
+/// render fill the pane while its off-pane pixels are clipped instead of spilling
+/// past the border.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Crop {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where a PNG lands in the pane: the cell rectangle to draw into, plus the source
+/// window to draw from when the image is larger than the pane.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Placement {
+    pub cell: Rect,
+    pub crop: Option<Crop>,
+}
+
+/// Center a PNG within `pane`, cropping to the pane when the image overflows it.
+///
+/// Kitty places a natural-size image from the cursor cell. A preview rendered at
+/// zoom 1 is never larger than its pane, so it is simply centered; a zoomed render
+/// can exceed the pane, so its centered pane-sized window is cropped out and the rest
+/// clipped.
+pub fn place_png(pane: Rect, png: &[u8]) -> Placement {
+    let uncropped = Placement {
+        cell: pane,
+        crop: None,
+    };
     let Some((image_width, image_height)) = png_dimensions(png) else {
-        return pane;
+        return uncropped;
     };
     let Ok(terminal) = crossterm::terminal::window_size() else {
-        return pane;
+        return uncropped;
     };
     if terminal.columns == 0 || terminal.rows == 0 || terminal.width == 0 || terminal.height == 0 {
-        return pane;
+        return uncropped;
     }
     let cell_width = u32::from(terminal.width) / u32::from(terminal.columns);
     let cell_height = u32::from(terminal.height) / u32::from(terminal.rows);
-    center_png(pane, image_width, image_height, cell_width, cell_height)
+    place(pane, image_width, image_height, cell_width, cell_height)
 }
 
-fn center_png(
+fn place(
     pane: Rect,
     image_width: u32,
     image_height: u32,
     cell_width: u32,
     cell_height: u32,
-) -> Rect {
+) -> Placement {
     if cell_width == 0 || cell_height == 0 {
-        return pane;
+        return Placement {
+            cell: pane,
+            crop: None,
+        };
     }
-    let image_columns = image_width.div_ceil(cell_width).min(u32::from(pane.width)) as u16;
-    let image_rows = image_height
-        .div_ceil(cell_height)
-        .min(u32::from(pane.height)) as u16;
-    Rect::new(
-        pane.x + (pane.width - image_columns) / 2,
-        pane.y + (pane.height - image_rows) / 2,
-        image_columns,
-        image_rows,
-    )
+    let full_columns = image_width.div_ceil(cell_width);
+    let full_rows = image_height.div_ceil(cell_height);
+    let columns = full_columns.min(u32::from(pane.width));
+    let rows = full_rows.min(u32::from(pane.height));
+    let cell = Rect::new(
+        pane.x + (pane.width - columns as u16) / 2,
+        pane.y + (pane.height - rows as u16) / 2,
+        columns as u16,
+        rows as u16,
+    );
+    let crop =
+        (full_columns > u32::from(pane.width) || full_rows > u32::from(pane.height)).then(|| {
+            // Snap the window to whole cells so the visible pixels map one-to-one and
+            // stay crisp, then clamp to the image for panes that outsize it.
+            let width = (columns * cell_width).min(image_width);
+            let height = (rows * cell_height).min(image_height);
+            Crop {
+                x: (image_width - width) / 2,
+                y: (image_height - height) / 2,
+                width,
+                height,
+            }
+        });
+    Placement { cell, crop }
 }
 
-/// Replace this preview instance's image and place it at its natural aspect ratio in `pane`.
+/// Replace this preview instance's image and place it at its natural aspect ratio.
 ///
-/// The caller rasterizes the image to fit the pane. Omitting Kitty's cell dimensions
-/// here lets Kitty derive the placement from the PNG's pixels instead of stretching it
-/// to the pane's (usually different) aspect ratio.
+/// The caller rasterizes the image to fit (or overfill, when zoomed) the pane. Omitting
+/// Kitty's cell dimensions lets Kitty derive the placement from the PNG's pixels instead
+/// of stretching it to the pane's (usually different) aspect ratio; `crop` restricts the
+/// drawn source window so a zoomed image never spills past `cell`.
 pub fn display_png(
     image_id: ImageId,
     png: &[u8],
-    pane: Rect,
+    cell: Rect,
+    crop: Option<Crop>,
     out: &mut impl Write,
 ) -> io::Result<()> {
-    if pane.width == 0 || pane.height == 0 {
+    if cell.width == 0 || cell.height == 0 {
         return Ok(());
     }
 
     delete_image(image_id, out)?;
     upload_png(image_id, png, out)?;
+    let mut command = format!("a=p,i={},p={PLACEMENT_ID},C=1,q=2", image_id.0);
+    if let Some(crop) = crop {
+        use std::fmt::Write as _;
+        let _ = write!(
+            command,
+            ",x={},y={},w={},h={}",
+            crop.x, crop.y, crop.width, crop.height
+        );
+    }
     write!(
         out,
-        "\x1b[s\x1b[{};{}H\x1b_Ga=p,i={},p={PLACEMENT_ID},C=1,q=2;\x1b\\\x1b[u",
-        pane.y + 1,
-        pane.x + 1,
-        image_id.0,
+        "\x1b[s\x1b[{};{}H\x1b_G{command};\x1b\\\x1b[u",
+        cell.y + 1,
+        cell.x + 1,
     )?;
     out.flush()
 }
@@ -182,16 +235,28 @@ mod tests {
     #[test]
     fn centers_natural_size_pngs_in_the_available_pane() {
         assert_eq!(
-            center_png(Rect::new(10, 5, 80, 20), 160, 80, 8, 16),
-            Rect::new(40, 12, 20, 5),
+            place(Rect::new(10, 5, 80, 20), 160, 80, 8, 16),
+            Placement {
+                cell: Rect::new(40, 12, 20, 5),
+                crop: None,
+            },
         );
     }
 
     #[test]
-    fn large_pngs_stay_within_the_available_pane() {
+    fn oversized_pngs_fill_the_pane_and_crop_their_overflow_to_its_center() {
         assert_eq!(
-            center_png(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16),
-            Rect::new(10, 5, 80, 20),
+            place(Rect::new(10, 5, 80, 20), 2_000, 800, 8, 16),
+            Placement {
+                cell: Rect::new(10, 5, 80, 20),
+                // 80 cols * 8px = 640, 20 rows * 16px = 320, centered in a 2000x800 image.
+                crop: Some(Crop {
+                    x: 680,
+                    y: 240,
+                    width: 640,
+                    height: 320,
+                }),
+            },
         );
     }
 
@@ -202,6 +267,7 @@ mod tests {
             FIRST_PREVIEW_IMAGE,
             b"png",
             Rect::new(42, 3, 50, 18),
+            None,
             &mut bytes,
         )
         .unwrap();
@@ -212,6 +278,29 @@ mod tests {
         assert!(text.contains("a=p,i=101,p=1,C=1,q=2"));
         assert!(!text.contains(",c="));
         assert!(!text.contains(",r="));
+        assert!(!text.contains(",w="));
+        assert!(!text.contains(",h="));
+        assert_all_commands_suppress_responses(&text);
+    }
+
+    #[test]
+    fn cropped_placements_emit_the_source_window() {
+        let mut bytes = Vec::new();
+        display_png(
+            FIRST_PREVIEW_IMAGE,
+            b"png",
+            Rect::new(10, 5, 80, 20),
+            Some(Crop {
+                x: 680,
+                y: 240,
+                width: 640,
+                height: 320,
+            }),
+            &mut bytes,
+        )
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("a=p,i=101,p=1,C=1,q=2,x=680,y=240,w=640,h=320"));
         assert_all_commands_suppress_responses(&text);
     }
 
@@ -222,6 +311,7 @@ mod tests {
             FIRST_PREVIEW_IMAGE,
             b"png",
             Rect::new(0, 0, 1, 1),
+            None,
             &mut first,
         )
         .unwrap();
@@ -232,6 +322,7 @@ mod tests {
             SECOND_PREVIEW_IMAGE,
             b"png",
             Rect::new(1, 1, 2, 3),
+            None,
             &mut second,
         )
         .unwrap();
@@ -250,6 +341,7 @@ mod tests {
             FIRST_PREVIEW_IMAGE,
             &vec![0; 4_000],
             Rect::new(0, 0, 1, 1),
+            None,
             &mut bytes,
         )
         .unwrap();

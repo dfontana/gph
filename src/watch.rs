@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::preview_ui::{
     PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event, pane_pixels,
+    zoom_action,
 };
 use crate::render::Renderer;
 
@@ -48,7 +49,7 @@ impl State {
             }
         };
         let (width, height) = pane_pixels(pane);
-        match self.renderer.png(&source, width, height) {
+        match self.renderer.png(&source, width, height, self.image.zoom()) {
             Ok(png) => {
                 self.image.show(png);
                 self.error = None;
@@ -114,6 +115,12 @@ fn event_loop(
             let event = event::read().map_err(|error| error.to_string())?;
             if is_quit_event(&event) {
                 return Ok(());
+            }
+            if let Some(action) = zoom_action(&event) {
+                if state.image.apply_zoom(action) {
+                    refresh_and_draw(terminal, state)?;
+                }
+                continue;
             }
             if matches!(event, Event::Resize(_, _)) {
                 refresh_and_draw(terminal, state)?;
@@ -202,7 +209,10 @@ fn draw(frame: &mut ratatui::Frame, state: &State) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            " Watching for changes · Ctrl-C quit ",
+            format!(
+                " Watching for changes ·{} +/- zoom · Ctrl-C quit ",
+                zoom_label(state.image.zoom()),
+            ),
             Style::default().fg(Color::DarkGray),
         ))),
         Rect::new(
@@ -212,6 +222,15 @@ fn draw(frame: &mut ratatui::Frame, state: &State) {
             1,
         ),
     );
+}
+
+/// The current magnification for the status hint, blank at an exact fit.
+fn zoom_label(zoom: f32) -> String {
+    if (zoom - 1.0).abs() < 1e-3 {
+        String::new()
+    } else {
+        format!(" {}% ·", (zoom * 100.0).round() as u32)
+    }
 }
 
 fn watch_viewport(viewport_top: u16, width: u16, terminal_height: u16) -> Rect {

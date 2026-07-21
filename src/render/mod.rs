@@ -51,9 +51,15 @@ impl Renderer {
             .ok_or_else(|| "render failed: no Mermaid diagram detected".to_string())
     }
 
-    pub fn png(&self, source: &str, width: u32, height: u32) -> Result<Vec<u8>, String> {
+    /// Rasterize `source` to fit `width` x `height`, magnified by `zoom`.
+    ///
+    /// The fit box only ever shrinks an oversized diagram to the pane; `zoom` is applied
+    /// as the raster scale, which is what actually enlarges the preview past its fitted
+    /// (or natural) size so callers can zoom in on detail.
+    pub fn png(&self, source: &str, width: u32, height: u32, zoom: f32) -> Result<Vec<u8>, String> {
         let options = RasterOptions::default()
-            .with_fit_to(RasterFitBox::contain(width.max(1), height.max(1)));
+            .with_fit_to(RasterFitBox::contain(width.max(1), height.max(1)))
+            .with_scale(zoom.max(1.0));
         self.raster_with_options(source, RasterFormat::Png, &options)
     }
 
@@ -165,8 +171,28 @@ mod tests {
 
     #[test]
     fn renders_png_for_preview() {
-        let png = Renderer::new().png(FLOWCHART, 640, 480).unwrap();
+        let png = Renderer::new().png(FLOWCHART, 640, 480, 1.0).unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn zoom_enlarges_the_rendered_png() {
+        let renderer = Renderer::new();
+        let fit = renderer.png(FLOWCHART, 640, 480, 1.0).unwrap();
+        let zoomed = renderer.png(FLOWCHART, 640, 480, 2.0).unwrap();
+        let dims = |png: &[u8]| {
+            (
+                u32::from_be_bytes(png[16..20].try_into().unwrap()),
+                u32::from_be_bytes(png[20..24].try_into().unwrap()),
+            )
+        };
+        let (fit_width, fit_height) = dims(&fit);
+        let (zoomed_width, zoomed_height) = dims(&zoomed);
+        assert!(zoomed_width > fit_width, "{zoomed_width} vs {fit_width}");
+        assert!(
+            zoomed_height > fit_height,
+            "{zoomed_height} vs {fit_height}"
+        );
     }
 
     #[test]
@@ -180,7 +206,7 @@ mod tests {
     #[test]
     fn renders_bom_prefixed_png() {
         let png = Renderer::new()
-            .png(&format!("\u{feff}{FLOWCHART}"), 640, 480)
+            .png(&format!("\u{feff}{FLOWCHART}"), 640, 480, 1.0)
             .unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
