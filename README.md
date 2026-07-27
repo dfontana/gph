@@ -80,17 +80,22 @@ returns it to a comfortably padded pane fit, and click-and-drag pans a zoomed di
 `Ctrl-Q` or `Ctrl-C`; the socket is removed and a later Helix connection reports
 that `gph lsp` needs to be started again.
 
-## Render files
+## Render files or the active terminal
 
 ```sh
 gph render diagram.mmd -o diagram.svg
 gph render diagram.mmd -o diagram.png
 printf 'flowchart TD\nA --> B\n' | gph render - -o diagram.pdf
+printf 'flowchart TD\nA --> B\n' | gph render
 ```
 
-The format is inferred from the `.svg`, `.png`, `.jpg`/`.jpeg`, or `.pdf`
-destination extension, or set explicitly with `--format`. Failed rendering never
-writes the output. `gph export` remains an alias for `gph render`.
+Omit `--out` to open the same full-screen interactive Kitty viewer used by
+`gph lsp`; press `Ctrl-Q` or `Ctrl-C` to exit. The input positional argument
+defaults to `-`, so piped Mermaid can be rendered without an extra argument; a
+file can also be displayed with `gph render diagram.mmd`. The format is inferred
+from the `.svg`, `.png`, `.jpg`/`.jpeg`, or `.pdf` destination extension, or set
+explicitly with `--format`. Failed rendering never writes the output.
+`gph export` remains an alias for `gph render`.
 
 ## Scope
 

@@ -35,14 +35,15 @@ enum Command {
     Lsp,
     /// Bridge an LSP client's stdin/stdout to the workspace preview daemon.
     LspConnect,
-    /// Render Mermaid source as SVG, PNG, JPEG, or PDF.
+    /// Render Mermaid source as a file or in the active Kitty terminal.
     #[command(visible_alias = "export")]
     Render {
-        /// Mermaid input file, or - to read stdin.
+        /// Mermaid input file, or - to read stdin. Defaults to stdin.
+        #[arg(default_value = "-")]
         input: PathBuf,
-        /// Destination file.
+        /// Destination file. Omit to display the diagram in Kitty.
         #[arg(short = 'o', long = "out", alias = "output", value_name = "OUTPUT")]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Output format. Inferred from OUTPUT when omitted.
         #[arg(short, long, value_enum)]
         format: Option<OutputFormat>,
@@ -67,7 +68,7 @@ fn main() {
             input,
             output,
             format,
-        } => render(&input, &output, format),
+        } => render(&input, output.as_deref(), format),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
@@ -86,20 +87,32 @@ fn watch(file: PathBuf) -> Result<(), String> {
 
 fn render(
     input: &Path,
-    output: &Path,
+    output: Option<&Path>,
     requested_format: Option<OutputFormat>,
 ) -> Result<(), String> {
-    let format = output_format(output, requested_format)?;
     let source = read_input(input)?;
-    let renderer = render::Renderer::new();
-    let bytes = match format {
-        OutputFormat::Svg => renderer.svg(&source)?.into_bytes(),
-        OutputFormat::Png => renderer.raster(&source, render::RasterFormat::Png)?,
-        OutputFormat::Jpeg => renderer.raster(&source, render::RasterFormat::Jpeg)?,
-        OutputFormat::Pdf => renderer.raster(&source, render::RasterFormat::Pdf)?,
-    };
-    render::files::write_atomically(output, &bytes)
-        .map_err(|error| format!("cannot write '{}': {error}", output.display()))
+    match output {
+        Some(output) => {
+            let renderer = render::Renderer::new();
+            let format = output_format(output, requested_format)?;
+            let bytes = match format {
+                OutputFormat::Svg => renderer.svg(&source)?.into_bytes(),
+                OutputFormat::Png => renderer.raster(&source, render::RasterFormat::Png)?,
+                OutputFormat::Jpeg => renderer.raster(&source, render::RasterFormat::Jpeg)?,
+                OutputFormat::Pdf => renderer.raster(&source, render::RasterFormat::Pdf)?,
+            };
+            render::files::write_atomically(output, &bytes)
+                .map_err(|error| format!("cannot write '{}': {error}", output.display()))
+        }
+        None => {
+            if requested_format.is_some_and(|format| !matches!(format, OutputFormat::Png)) {
+                return Err(
+                    "terminal display output is PNG; omit --format or use --format png".to_string(),
+                );
+            }
+            preview::run_source_preview(input.display().to_string(), source)
+        }
+    }
 }
 
 fn output_format(
@@ -159,5 +172,21 @@ mod tests {
             panic!("expected watch command");
         };
         assert_eq!(file, Path::new("diagram.mmd"));
+    }
+
+    #[test]
+    fn render_defaults_to_stdin_and_terminal_display() {
+        let cli = Cli::try_parse_from(["gph", "render"]).unwrap();
+        let Command::Render {
+            input,
+            output,
+            format,
+        } = cli.command
+        else {
+            panic!("expected render command");
+        };
+        assert_eq!(input, Path::new("-"));
+        assert!(output.is_none());
+        assert!(format.is_none());
     }
 }

@@ -209,9 +209,37 @@ impl LspPreviewState {
     }
 }
 
+/// Seed one document event, then run the exact viewer path used by `gph lsp`.
+pub fn run_source_preview(uri: String, source: String) -> Result<(), String> {
+    if !crate::kitty::is_available() {
+        return Err(
+            "`gph render` without --out requires Kitty (set KITTY_WINDOW_ID or TERM=xterm-kitty)"
+                .to_string(),
+        );
+    }
+    let (updates, receiver) = std::sync::mpsc::channel();
+    updates
+        .send(PreviewEvent::Set {
+            client: 0,
+            uri,
+            text: source,
+            version: 1,
+        })
+        .map_err(|_| "gph preview viewer stopped before it started".to_string())?;
+
+    // Keep the source open until the interactive viewer exits. Otherwise its receiver sees a
+    // disconnected LSP event channel immediately after consuming the initial document.
+    let result = run_lsp_preview(receiver);
+    drop(updates);
+    result
+}
+
 /// Run the dedicated Kitty pane that previews the most recently changed LSP document.
 pub fn run_lsp_preview(receiver: Receiver<PreviewEvent>) -> Result<(), String> {
-    let mut state = LspPreviewState::new();
+    run_preview(LspPreviewState::new(), receiver)
+}
+
+fn run_preview(mut state: LspPreviewState, receiver: Receiver<PreviewEvent>) -> Result<(), String> {
     let mut session = TerminalSession::alternate()?;
     let result = lsp_preview_loop(session.terminal(), &receiver, &mut state);
     let cleanup = session.cleanup(&mut state.image);
