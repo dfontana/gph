@@ -94,7 +94,15 @@ Omit `--out` to open the same full-screen interactive Kitty viewer used by
 defaults to `-`, so piped Mermaid can be rendered without an extra argument; a
 file can also be displayed with `gph render diagram.mmd`. The format is inferred
 from the `.svg`, `.png`, `.jpg`/`.jpeg`, or `.pdf` destination extension, or set
-explicitly with `--format`. Failed rendering never writes the output.
+explicitly with `--format`. PNG and JPEG file exports default to a 3x (300%) pixel
+scale for sharper output; pass `--scale 1` for the previous 1x dimensions, or
+another finite positive factor. `--scale` applies only to PNG and JPEG files,
+while SVG and PDF remain vector exports. Failed rendering never writes the output.
+
+SVG exports have an explicitly transparent root. A viewer may still show a white,
+checkerboard, or other canvas behind the SVG; that is the viewer's canvas, not a
+background painted into the exported diagram.
+
 `gph export` remains an alias for `gph render`.
 
 ## Scope

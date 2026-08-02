@@ -47,6 +47,14 @@ enum Command {
         /// Output format. Inferred from OUTPUT when omitted.
         #[arg(short, long, value_enum)]
         format: Option<OutputFormat>,
+        /// Pixel scale for PNG/JPEG file exports. Defaults to 10.0.
+        #[arg(
+            long,
+            value_name = "FACTOR",
+            value_parser = parse_scale,
+            allow_negative_numbers = true
+        )]
+        scale: Option<f32>,
     },
 }
 
@@ -68,7 +76,8 @@ fn main() {
             input,
             output,
             format,
-        } => render(&input, output.as_deref(), format),
+            scale,
+        } => render(&input, output.as_deref(), format, scale),
     };
     if let Err(error) = result {
         eprintln!("error: {error}");
@@ -89,22 +98,32 @@ fn render(
     input: &Path,
     output: Option<&Path>,
     requested_format: Option<OutputFormat>,
+    requested_scale: Option<f32>,
 ) -> Result<(), String> {
     let source = read_input(input)?;
     match output {
         Some(output) => {
             let renderer = render::Renderer::new();
             let format = output_format(output, requested_format)?;
+            validate_file_scale(format, requested_scale)?;
+            let raster_scale = file_raster_scale(requested_scale);
             let bytes = match format {
                 OutputFormat::Svg => renderer.svg(&source)?.into_bytes(),
-                OutputFormat::Png => renderer.raster(&source, render::RasterFormat::Png)?,
-                OutputFormat::Jpeg => renderer.raster(&source, render::RasterFormat::Jpeg)?,
+                OutputFormat::Png => {
+                    renderer.raster_with_scale(&source, render::RasterFormat::Png, raster_scale)?
+                }
+                OutputFormat::Jpeg => {
+                    renderer.raster_with_scale(&source, render::RasterFormat::Jpeg, raster_scale)?
+                }
                 OutputFormat::Pdf => renderer.raster(&source, render::RasterFormat::Pdf)?,
             };
             render::files::write_atomically(output, &bytes)
                 .map_err(|error| format!("cannot write '{}': {error}", output.display()))
         }
         None => {
+            if requested_scale.is_some() {
+                return Err("--scale only applies to PNG and JPEG file exports".to_string());
+            }
             if requested_format.is_some_and(|format| !matches!(format, OutputFormat::Png)) {
                 return Err(
                     "terminal display output is PNG; omit --format or use --format png".to_string(),
@@ -113,6 +132,17 @@ fn render(
             preview::run_source_preview(input.display().to_string(), source)
         }
     }
+}
+
+fn validate_file_scale(format: OutputFormat, requested_scale: Option<f32>) -> Result<(), String> {
+    if requested_scale.is_some() && matches!(format, OutputFormat::Svg | OutputFormat::Pdf) {
+        return Err("--scale only applies to PNG and JPEG file exports".to_string());
+    }
+    Ok(())
+}
+
+fn file_raster_scale(requested_scale: Option<f32>) -> f32 {
+    requested_scale.unwrap_or(render::DEFAULT_FILE_RASTER_SCALE)
 }
 
 fn output_format(
@@ -138,6 +168,21 @@ fn output_format(
     }
 }
 
+fn parse_scale(value: &str) -> Result<f32, String> {
+    let scale = value
+        .parse::<f32>()
+        .map_err(|_| format!("invalid scale '{value}': expected a number greater than zero"))?;
+    if !scale.is_finite() {
+        return Err(format!("invalid scale '{value}': value must be finite"));
+    }
+    if scale <= 0.0 {
+        return Err(format!(
+            "invalid scale '{value}': value must be greater than zero"
+        ));
+    }
+    Ok(scale)
+}
+
 fn read_input(path: &Path) -> Result<String, String> {
     if path == Path::new("-") {
         let mut source = String::new();
@@ -153,7 +198,7 @@ fn read_input(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, read_input};
+    use super::{Cli, Command, OutputFormat, file_raster_scale, read_input, validate_file_scale};
     use clap::Parser;
     use std::path::Path;
 
@@ -181,6 +226,7 @@ mod tests {
             input,
             output,
             format,
+            scale,
         } = cli.command
         else {
             panic!("expected render command");
@@ -188,5 +234,71 @@ mod tests {
         assert_eq!(input, Path::new("-"));
         assert!(output.is_none());
         assert!(format.is_none());
+        assert!(scale.is_none());
+    }
+
+    #[test]
+    fn parses_explicit_render_scale() {
+        let cli = Cli::try_parse_from([
+            "gph",
+            "render",
+            "diagram.mmd",
+            "-o",
+            "diagram.png",
+            "--scale",
+            "1",
+        ])
+        .unwrap();
+        let Command::Render { scale, .. } = cli.command else {
+            panic!("expected render command");
+        };
+        assert_eq!(scale, Some(1.0));
+    }
+
+    #[test]
+    fn export_alias_preserves_render_invocation_compatibility() {
+        let cli =
+            Cli::try_parse_from(["gph", "export", "diagram.mmd", "-o", "diagram.png"]).unwrap();
+        let Command::Render {
+            input,
+            output,
+            format,
+            scale,
+        } = cli.command
+        else {
+            panic!("expected render command");
+        };
+        assert_eq!(input, Path::new("diagram.mmd"));
+        assert_eq!(output.as_deref(), Some(Path::new("diagram.png")));
+        assert!(format.is_none());
+        assert!(scale.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_render_scales() {
+        for (value, expected) in [
+            ("0", "greater than zero"),
+            ("-1", "greater than zero"),
+            ("NaN", "must be finite"),
+            ("inf", "must be finite"),
+            ("-inf", "must be finite"),
+        ] {
+            let scale_argument = format!("--scale={value}");
+            let error = match Cli::try_parse_from(["gph", "render", &scale_argument]) {
+                Ok(_) => panic!("expected invalid scale: {value}"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains(expected), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn file_raster_scale_defaults_only_pixel_exports_and_rejects_vector_scale() {
+        assert_eq!(file_raster_scale(None), 10.0);
+        assert_eq!(file_raster_scale(Some(1.0)), 1.0);
+        assert!(validate_file_scale(OutputFormat::Svg, Some(1.0)).is_err());
+        assert!(validate_file_scale(OutputFormat::Pdf, Some(1.0)).is_err());
+        assert!(validate_file_scale(OutputFormat::Png, Some(1.0)).is_ok());
+        assert!(validate_file_scale(OutputFormat::Jpeg, None).is_ok());
     }
 }
