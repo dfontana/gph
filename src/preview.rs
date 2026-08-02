@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::preview_ui::{
     DragTracker, PreviewImage, PreviewTerminal, TerminalSession, combine, is_quit_event,
@@ -49,22 +50,33 @@ struct PreviewDocument {
     cache: Option<PreviewCache>,
 }
 
+#[derive(Default)]
+struct ExportPrompt {
+    input: String,
+    error: Option<String>,
+}
+
 struct LspPreviewState {
     documents: BTreeMap<(u64, String), PreviewDocument>,
     sequence: u64,
     renderer: Renderer,
     image: PreviewImage,
     render_error: Option<String>,
+    /// Set only for the real LSP daemon. Terminal-only render previews leave this disabled.
+    export_dir: Option<PathBuf>,
+    prompt: Option<ExportPrompt>,
 }
 
 impl LspPreviewState {
-    fn new() -> Self {
+    fn new(export_dir: Option<PathBuf>) -> Self {
         Self {
             documents: BTreeMap::new(),
             sequence: 0,
             renderer: Renderer::new(),
             image: PreviewImage::new(),
             render_error: None,
+            export_dir,
+            prompt: None,
         }
     }
 
@@ -190,14 +202,65 @@ impl LspPreviewState {
 
     /// Right-aligned header title: the current zoom level and control hints.
     fn header_right(&self) -> String {
-        let zoom = self.image.zoom();
         format!(
-            " {}% · +/- zoom · drag or scroll to pan ",
-            (zoom * 100.0).round() as u32
+            " {}% · +/- zoom · drag or scroll to pan{} ",
+            (self.image.zoom() * 100.0).round() as u32,
+            self.export_dir.as_ref().map_or("", |_| " · e export")
         )
     }
 
-    /// The footer line: the selected document's URI, or a waiting/error notice.
+    fn open_export_prompt(&mut self) -> bool {
+        if self.export_dir.is_none() || self.selected().is_none() {
+            return false;
+        }
+        self.prompt = Some(ExportPrompt::default());
+        true
+    }
+
+    fn handle_prompt_event(&mut self, event: &Event) -> bool {
+        let Event::Key(KeyEvent {
+            code, modifiers, ..
+        }) = event
+        else {
+            return false;
+        };
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        match code {
+            KeyCode::Esc => self.prompt = None,
+            KeyCode::Backspace => {
+                let prompt = self.prompt.as_mut().unwrap();
+                prompt.input.pop();
+                prompt.error = None;
+            }
+            KeyCode::Char(character) => {
+                let prompt = self.prompt.as_mut().unwrap();
+                prompt.input.push(*character);
+                prompt.error = None;
+            }
+            KeyCode::Enter => {
+                let result = self.export(&self.prompt.as_ref().unwrap().input);
+                match result {
+                    Ok(()) => self.prompt = None,
+                    Err(error) => self.prompt.as_mut().unwrap().error = Some(error),
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn export(&self, filename: &str) -> Result<(), String> {
+        let destination = export_destination(self.export_dir.as_ref().unwrap(), filename)?;
+        let source = self
+            .selected()
+            .ok_or_else(|| "no active LSP document to export".to_string())?
+            .1;
+        crate::render::export(source, &destination, None, None)
+    }
+
+    /// The footer line: the selected document's URI, or a waiting/error message.
     fn footer(&self) -> String {
         if let Some(error) = &self.render_error {
             return error.clone();
@@ -207,6 +270,13 @@ impl LspPreviewState {
             None => " Waiting for a Mermaid document from an LSP client ".to_string(),
         }
     }
+}
+
+fn export_destination(directory: &Path, filename: &str) -> Result<PathBuf, String> {
+    let path = Path::new(filename);
+    (directory.is_absolute() && !filename.is_empty() && path.file_name() == Some(path.as_os_str()))
+        .then(|| directory.join(path))
+        .ok_or_else(|| "export filename must be a file name".to_string())
 }
 
 /// Seed one document event, then run the exact viewer path used by `gph lsp`.
@@ -229,14 +299,16 @@ pub fn run_source_preview(uri: String, source: String) -> Result<(), String> {
 
     // Keep the source open until the interactive viewer exits. Otherwise its receiver sees a
     // disconnected LSP event channel immediately after consuming the initial document.
-    let result = run_lsp_preview(receiver);
+    let result = run_preview(LspPreviewState::new(None), receiver);
     drop(updates);
     result
 }
 
 /// Run the dedicated Kitty pane that previews the most recently changed LSP document.
 pub fn run_lsp_preview(receiver: Receiver<PreviewEvent>) -> Result<(), String> {
-    run_preview(LspPreviewState::new(), receiver)
+    let export_dir = std::env::current_dir()
+        .map_err(|error| format!("cannot determine the LSP launch directory: {error}"))?;
+    run_preview(LspPreviewState::new(Some(export_dir)), receiver)
 }
 
 fn run_preview(mut state: LspPreviewState, receiver: Receiver<PreviewEvent>) -> Result<(), String> {
@@ -258,17 +330,7 @@ fn lsp_preview_loop(
     let mut drag = DragTracker::new();
 
     loop {
-        let mut changed = false;
-        loop {
-            match receiver.try_recv() {
-                Ok(PreviewEvent::Fatal(error)) => return Err(error),
-                Ok(event) => changed |= state.apply(event),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("gph LSP event channel disconnected".to_string());
-                }
-            }
-        }
+        let changed = drain_preview_events(receiver, state)?;
         if changed {
             dirty = true;
             preview_dirty = true;
@@ -290,10 +352,12 @@ fn lsp_preview_loop(
                 .map_err(|error| error.to_string())?;
             let size = terminal.size().map_err(|error| error.to_string())?;
             let pane = lsp_preview_panes(Rect::new(0, 0, size.width, size.height)).preview;
-            state
-                .image
-                .display_if_dirty(pane, terminal.backend_mut())
-                .map_err(|error| format!("Kitty preview failed: {error}"))?;
+            if state.prompt.is_none() {
+                state
+                    .image
+                    .display_if_dirty(pane, terminal.backend_mut())
+                    .map_err(|error| format!("Kitty preview failed: {error}"))?;
+            }
             dirty = false;
         }
 
@@ -309,6 +373,33 @@ fn lsp_preview_loop(
         let event = event::read().map_err(|error| error.to_string())?;
         if is_quit_event(&event) {
             return Ok(());
+        }
+        if state.prompt.is_some() {
+            let enter = matches!(event, Event::Key(key) if key.code == KeyCode::Enter);
+            if enter && drain_preview_events(receiver, state)? {
+                dirty = true;
+                preview_dirty = true;
+                deadline = Some(Instant::now() + DEBOUNCE);
+            }
+            dirty |= state.handle_prompt_event(&event);
+            if state.prompt.is_none() {
+                state.image.mark_dirty();
+                drag = DragTracker::new();
+            }
+            if !matches!(event, Event::Resize(_, _)) {
+                continue;
+            }
+        }
+        if matches!(event, Event::Key(key) if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::NONE)
+            && state.open_export_prompt()
+        {
+            state
+                .image
+                .hide(terminal.backend_mut())
+                .map_err(|error| format!("Kitty preview failed: {error}"))?;
+            dirty = true;
+            drag = DragTracker::new();
+            continue;
         }
         if let Some(action) = zoom_action(&event) {
             if state.image.apply_zoom(action) {
@@ -335,6 +426,23 @@ fn lsp_preview_loop(
             deadline = Some(Instant::now());
             state.image.mark_dirty();
             dirty = true;
+        }
+    }
+}
+
+fn drain_preview_events(
+    receiver: &Receiver<PreviewEvent>,
+    state: &mut LspPreviewState,
+) -> Result<bool, String> {
+    let mut changed = false;
+    loop {
+        match receiver.try_recv() {
+            Ok(PreviewEvent::Fatal(error)) => return Err(error),
+            Ok(event) => changed |= state.apply(event),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(changed),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err("gph LSP event channel disconnected".to_string());
+            }
         }
     }
 }
@@ -376,15 +484,105 @@ fn draw_lsp_preview(frame: &mut ratatui::Frame, state: &LspPreviewState) {
         Paragraph::new(Line::from(Span::styled(state.footer(), style))),
         panes.status,
     );
+    if let Some(prompt) = &state.prompt {
+        draw_export_prompt(frame, prompt);
+    }
+}
+
+fn draw_export_prompt(frame: &mut ratatui::Frame, prompt: &ExportPrompt) {
+    let area = frame.area();
+    let width = area.width.min(60);
+    let height = area.height.min(if prompt.error.is_some() { 6 } else { 5 });
+    if width == 0 || height == 0 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    let mut text = format!("Name: {}\nEnter export · Esc cancel", prompt.input);
+    if let Some(error) = &prompt.error {
+        text.push_str(&format!("\nError: {error}"));
+    }
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Export filename "),
+        ),
+        popup,
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn set_document(state: &mut LspPreviewState, text: &str, version: i64) {
+        assert!(state.apply(PreviewEvent::Set {
+            client: 1,
+            uri: "file:///diagram.mmd".to_string(),
+            text: text.to_string(),
+            version,
+        }));
+    }
+
+    fn type_filename(state: &mut LspPreviewState, filename: &str) {
+        for character in filename.chars() {
+            assert!(state.handle_prompt_event(&key(KeyCode::Char(character))));
+        }
+    }
+
+    #[test]
+    fn export_prompt_uses_current_source_and_preserves_failed_output() {
+        let root = std::env::temp_dir().join(format!("gph-preview-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir(&root).unwrap();
+        assert!(export_destination(&root, "../diagram.svg").is_err());
+        let mut state = LspPreviewState::new(Some(root.clone()));
+        set_document(&mut state, "flowchart TD\nA[Old] --> B\n", 1);
+        assert!(state.open_export_prompt());
+        type_filename(&mut state, "diagram.svg");
+        let (updates, receiver) = std::sync::mpsc::channel();
+        updates
+            .send(PreviewEvent::Set {
+                client: 1,
+                uri: "file:///diagram.mmd".to_string(),
+                text: "flowchart TD\nA[Queued] --> B\n".to_string(),
+                version: 2,
+            })
+            .unwrap();
+        assert!(drain_preview_events(&receiver, &mut state).unwrap());
+        assert!(state.handle_prompt_event(&key(KeyCode::Enter)));
+        let output = root.join("diagram.svg");
+        assert!(state.prompt.is_none());
+        assert!(std::fs::read_to_string(&output).unwrap().contains("Queued"));
+
+        std::fs::write(&output, b"keep existing output").unwrap();
+        set_document(&mut state, "not Mermaid", 3);
+        assert!(state.open_export_prompt());
+        type_filename(&mut state, "diagram.svg");
+        assert!(state.handle_prompt_event(&key(KeyCode::Enter)));
+        assert!(
+            state
+                .prompt
+                .as_ref()
+                .is_some_and(|prompt| prompt.error.is_some())
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep existing output");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn lsp_preview_returns_to_another_client_when_the_latest_client_disconnects() {
-        let mut state = LspPreviewState::new();
+        let mut state = LspPreviewState::new(None);
         state.apply(PreviewEvent::Set {
             client: 1,
             uri: "file:///first.mmd".to_string(),
@@ -411,7 +609,7 @@ mod tests {
 
     #[test]
     fn lsp_preview_ignores_stale_document_versions() {
-        let mut state = LspPreviewState::new();
+        let mut state = LspPreviewState::new(None);
         assert!(state.apply(PreviewEvent::Set {
             client: 1,
             uri: "file:///diagram.mmd".to_string(),
@@ -429,7 +627,7 @@ mod tests {
 
     #[test]
     fn invalid_selected_document_never_reuses_another_documents_preview() {
-        let mut state = LspPreviewState::new();
+        let mut state = LspPreviewState::new(None);
         state.apply(PreviewEvent::Set {
             client: 1,
             uri: "file:///a.mmd".to_string(),
@@ -456,7 +654,7 @@ mod tests {
 
     #[test]
     fn invalid_selected_document_resizes_only_its_own_cached_preview() {
-        let mut state = LspPreviewState::new();
+        let mut state = LspPreviewState::new(None);
         state.apply(PreviewEvent::Set {
             client: 1,
             uri: "file:///a.mmd".to_string(),

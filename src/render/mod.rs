@@ -2,11 +2,13 @@ pub mod files;
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::path::Path;
 use std::sync::{
     OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 
+use clap::ValueEnum;
 use merman::render::{
     HeadlessRenderer, HostThemeAppearance, HostThemeOutput, HostThemeProfile, HostThemeRoles,
     HostThemeRootBackground,
@@ -15,7 +17,7 @@ use merman::render::{
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
 /// Default device-pixel scale for file PNG and JPEG exports.
-pub const DEFAULT_FILE_RASTER_SCALE: f32 = 10.0;
+const DEFAULT_FILE_RASTER_SCALE: f32 = 10.0;
 /// Clear space between a fitted preview diagram and the edge of its viewport.
 const PREVIEW_EDGE_PADDING: u32 = 15;
 
@@ -61,11 +63,61 @@ fn rose_pine_dawn_theme() -> HostThemeProfile {
         .build()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OutputFormat {
+    Svg,
+    Png,
+    #[value(alias = "jpg")]
+    Jpeg,
+    Pdf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RasterFormat {
     Png,
     Jpeg,
     Pdf,
 }
+
+/// Render `source` completely before atomically replacing `output`.
+pub fn export(
+    source: &str,
+    output: &Path,
+    requested_format: Option<OutputFormat>,
+    scale: Option<f32>,
+) -> Result<(), String> {
+    let format = requested_format
+        .or_else(|| {
+            let extension = output.extension()?.to_str()?.to_ascii_lowercase();
+            match extension.as_str() {
+                "svg" => Some(OutputFormat::Svg),
+                "png" => Some(OutputFormat::Png),
+                "jpg" | "jpeg" => Some(OutputFormat::Jpeg),
+                "pdf" => Some(OutputFormat::Pdf),
+                _ => None,
+            }
+        })
+        .ok_or_else(|| {
+            format!(
+                "cannot infer a format from '{}'; pass --format",
+                output.display()
+            )
+        })?;
+    if scale.is_some() && matches!(format, OutputFormat::Svg | OutputFormat::Pdf) {
+        return Err("--scale only applies to PNG and JPEG file exports".to_string());
+    }
+    let renderer = Renderer::new();
+    let scale = scale.unwrap_or(DEFAULT_FILE_RASTER_SCALE);
+    let bytes = match format {
+        OutputFormat::Svg => renderer.svg(source)?.into_bytes(),
+        OutputFormat::Png => renderer.raster_with_scale(source, RasterFormat::Png, scale)?,
+        OutputFormat::Jpeg => renderer.raster_with_scale(source, RasterFormat::Jpeg, scale)?,
+        OutputFormat::Pdf => renderer.raster(source, RasterFormat::Pdf)?,
+    };
+    files::write_atomically(output, bytes)
+        .map_err(|error| format!("cannot write '{}': {error}", output.display()))
+}
+
 static SVG_ID_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static SVG_PROCESS_NONCE: OnceLock<u64> = OnceLock::new();
 

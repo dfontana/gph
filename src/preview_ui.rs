@@ -195,6 +195,16 @@ impl PreviewImage {
         self.png = Some(png);
     }
 
+    /// Remove the displayed image while a modal dialog owns the terminal.
+    pub(crate) fn hide(&mut self, out: &mut impl io::Write) -> io::Result<()> {
+        if self.displayed {
+            kitty::delete_image(self.id, out)?;
+            self.displayed = false;
+            self.needs_upload = true;
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear(&mut self) {
         if self.png.take().is_some() {
             self.dirty = true;
