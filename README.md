@@ -76,7 +76,8 @@ document, and renders debounce briefly after the final edit. `gph` advertises
 LSP full text synchronization (`openClose` and `change = 1`) only, so
 `merman-lsp` remains the diagnostics provider. `+`/`-` zoom the preview and `0`
 returns it to a comfortably padded pane fit, and click-and-drag pans a zoomed diagram, matching
-`gph watch`. Quit the Kitty preview pane with
+`gph watch`. In the LSP daemon, `e` atomically exports the active unsaved document in its launch
+directory; invalid output leaves existing output untouched. Quit the Kitty preview pane with
 `Ctrl-Q` or `Ctrl-C`; the socket is removed and a later Helix connection reports
 that `gph lsp` needs to be started again.
 

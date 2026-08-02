@@ -15,7 +15,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+
+use render::OutputFormat;
 
 #[derive(Parser)]
 #[command(version, about = "Kitty-native Mermaid previewer and renderer")]
@@ -58,15 +60,6 @@ enum Command {
     },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum OutputFormat {
-    Svg,
-    Png,
-    #[value(alias = "jpg")]
-    Jpeg,
-    Pdf,
-}
-
 fn main() {
     let result = match Cli::parse().command {
         Command::Watch { file } => watch(file),
@@ -102,24 +95,7 @@ fn render(
 ) -> Result<(), String> {
     let source = read_input(input)?;
     match output {
-        Some(output) => {
-            let renderer = render::Renderer::new();
-            let format = output_format(output, requested_format)?;
-            validate_file_scale(format, requested_scale)?;
-            let raster_scale = file_raster_scale(requested_scale);
-            let bytes = match format {
-                OutputFormat::Svg => renderer.svg(&source)?.into_bytes(),
-                OutputFormat::Png => {
-                    renderer.raster_with_scale(&source, render::RasterFormat::Png, raster_scale)?
-                }
-                OutputFormat::Jpeg => {
-                    renderer.raster_with_scale(&source, render::RasterFormat::Jpeg, raster_scale)?
-                }
-                OutputFormat::Pdf => renderer.raster(&source, render::RasterFormat::Pdf)?,
-            };
-            render::files::write_atomically(output, &bytes)
-                .map_err(|error| format!("cannot write '{}': {error}", output.display()))
-        }
+        Some(output) => render::export(&source, output, requested_format, requested_scale),
         None => {
             if requested_scale.is_some() {
                 return Err("--scale only applies to PNG and JPEG file exports".to_string());
@@ -131,40 +107,6 @@ fn render(
             }
             preview::run_source_preview(input.display().to_string(), source)
         }
-    }
-}
-
-fn validate_file_scale(format: OutputFormat, requested_scale: Option<f32>) -> Result<(), String> {
-    if requested_scale.is_some() && matches!(format, OutputFormat::Svg | OutputFormat::Pdf) {
-        return Err("--scale only applies to PNG and JPEG file exports".to_string());
-    }
-    Ok(())
-}
-
-fn file_raster_scale(requested_scale: Option<f32>) -> f32 {
-    requested_scale.unwrap_or(render::DEFAULT_FILE_RASTER_SCALE)
-}
-
-fn output_format(
-    output: &Path,
-    requested_format: Option<OutputFormat>,
-) -> Result<OutputFormat, String> {
-    if let Some(format) = requested_format {
-        return Ok(format);
-    }
-    match output.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) if extension.eq_ignore_ascii_case("svg") => Ok(OutputFormat::Svg),
-        Some(extension) if extension.eq_ignore_ascii_case("png") => Ok(OutputFormat::Png),
-        Some(extension)
-            if extension.eq_ignore_ascii_case("jpeg") || extension.eq_ignore_ascii_case("jpg") =>
-        {
-            Ok(OutputFormat::Jpeg)
-        }
-        Some(extension) if extension.eq_ignore_ascii_case("pdf") => Ok(OutputFormat::Pdf),
-        _ => Err(format!(
-            "cannot infer a format from '{}'; pass --format",
-            output.display()
-        )),
     }
 }
 
@@ -198,7 +140,7 @@ fn read_input(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, OutputFormat, file_raster_scale, read_input, validate_file_scale};
+    use super::{Cli, Command, read_input};
     use clap::Parser;
     use std::path::Path;
 
@@ -290,15 +232,5 @@ mod tests {
             };
             assert!(error.to_string().contains(expected), "{value}: {error}");
         }
-    }
-
-    #[test]
-    fn file_raster_scale_defaults_only_pixel_exports_and_rejects_vector_scale() {
-        assert_eq!(file_raster_scale(None), 10.0);
-        assert_eq!(file_raster_scale(Some(1.0)), 1.0);
-        assert!(validate_file_scale(OutputFormat::Svg, Some(1.0)).is_err());
-        assert!(validate_file_scale(OutputFormat::Pdf, Some(1.0)).is_err());
-        assert!(validate_file_scale(OutputFormat::Png, Some(1.0)).is_ok());
-        assert!(validate_file_scale(OutputFormat::Jpeg, None).is_ok());
     }
 }
