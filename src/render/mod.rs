@@ -14,6 +14,8 @@ use merman::render::{
 };
 
 const PREVIEW_DIAGRAM_ID: &str = "gph-preview";
+/// Default device-pixel scale for file PNG and JPEG exports.
+pub const DEFAULT_FILE_RASTER_SCALE: f32 = 10.0;
 /// Clear space between a fitted preview diagram and the edge of its viewport.
 const PREVIEW_EDGE_PADDING: u32 = 15;
 
@@ -121,7 +123,17 @@ impl Renderer {
     }
 
     pub fn raster(&self, source: &str, format: RasterFormat) -> Result<Vec<u8>, String> {
-        self.raster_with_options(source, format, &RasterOptions::default())
+        self.raster_with_scale(source, format, 1.0)
+    }
+
+    pub fn raster_with_scale(
+        &self,
+        source: &str,
+        format: RasterFormat,
+        scale: f32,
+    ) -> Result<Vec<u8>, String> {
+        let options = RasterOptions::default().with_scale(scale);
+        self.raster_with_options(source, format, &options)
     }
 
     fn raster_with_options(
@@ -282,9 +294,33 @@ mod tests {
     #[test]
     fn svg_uses_rose_pine_dawn_roles_with_a_transparent_background() {
         let svg = Renderer::new().svg(FLOWCHART).unwrap();
-        assert!(svg.contains("background-color: transparent"), "{svg}");
+        let root = svg.split_once('>').expect("SVG root").0;
+        assert!(root.starts_with("<svg "), "{root}");
+        assert!(root.contains("style=\""), "{root}");
+        assert!(root.contains("background-color: transparent;"), "{root}");
         assert!(svg.contains("#575279"), "{svg}");
         assert!(svg.contains("#286983"), "{svg}");
+    }
+
+    #[test]
+    fn file_raster_scale_changes_png_dimensions() {
+        let renderer = Renderer::new();
+        let one = renderer
+            .raster_with_scale(FLOWCHART, RasterFormat::Png, 1.0)
+            .unwrap();
+        let three = renderer
+            .raster_with_scale(FLOWCHART, RasterFormat::Png, 3.0)
+            .unwrap();
+        let dimensions = |png: &[u8]| {
+            (
+                u32::from_be_bytes(png[16..20].try_into().unwrap()),
+                u32::from_be_bytes(png[20..24].try_into().unwrap()),
+            )
+        };
+        let (one_width, one_height) = dimensions(&one);
+        let (three_width, three_height) = dimensions(&three);
+        assert_eq!(three_width, one_width * 3);
+        assert_eq!(three_height, one_height * 3);
     }
 
     #[test]
